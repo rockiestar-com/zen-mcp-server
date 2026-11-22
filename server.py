@@ -19,22 +19,29 @@ as defined by the MCP protocol.
 """
 
 import asyncio
+import atexit
 import logging
 import os
 import sys
 import time
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
+# Try to load environment variables from .env file if dotenv is available
+# This is optional - environment variables can still be passed directly
+try:
+    from dotenv import load_dotenv
 
-# Load environment variables from .env file in the script's directory
-# This ensures .env is loaded regardless of the current working directory
-script_dir = Path(__file__).parent
-env_file = script_dir / ".env"
-load_dotenv(dotenv_path=env_file)
+    # Load environment variables from .env file in the script's directory
+    # This ensures .env is loaded regardless of the current working directory
+    script_dir = Path(__file__).parent
+    env_file = script_dir / ".env"
+    load_dotenv(dotenv_path=env_file)
+except ImportError:
+    # dotenv not available - this is fine, environment variables can still be passed directly
+    # This commonly happens when running via uvx or in minimal environments
+    pass
 
 from mcp.server import Server  # noqa: E402
 from mcp.server.models import InitializationOptions  # noqa: E402
@@ -47,28 +54,31 @@ from mcp.types import (  # noqa: E402
     ServerCapabilities,
     TextContent,
     Tool,
+    ToolAnnotations,
     ToolsCapability,
 )
 
 from config import (  # noqa: E402
     DEFAULT_MODEL,
-    __author__,
-    __updated__,
     __version__,
 )
 from tools import (  # noqa: E402
     AnalyzeTool,
+    ChallengeTool,
     ChatTool,
     CodeReviewTool,
     ConsensusTool,
     DebugIssueTool,
+    DocgenTool,
     ListModelsTool,
     PlannerTool,
-    Precommit,
+    PrecommitTool,
     RefactorTool,
-    TestGenerationTool,
+    SecauditTool,
+    TestGenTool,
     ThinkDeepTool,
     TracerTool,
+    VersionTool,
 )
 from tools.models import ToolOutput  # noqa: E402
 
@@ -105,7 +115,7 @@ stderr_handler.setFormatter(LocalTimeFormatter(log_format))
 root_logger.addHandler(stderr_handler)
 
 # Note: MCP stdio_server interferes with stderr during tool execution
-# All logs are properly written to /tmp/mcp_server.log for monitoring
+# All logs are properly written to logs/mcp_server.log for monitoring
 
 # Set root logger level
 root_logger.setLevel(getattr(logging, log_level, logging.INFO))
@@ -122,7 +132,7 @@ try:
     file_handler = RotatingFileHandler(
         log_dir / "mcp_server.log",
         maxBytes=20 * 1024 * 1024,  # 20MB max file size
-        backupCount=10,  # Keep 10 rotated files (200MB total)
+        backupCount=5,  # Keep 10 rotated files (100MB total)
         encoding="utf-8",
     )
     file_handler.setLevel(getattr(logging, log_level, logging.INFO))
@@ -133,8 +143,8 @@ try:
     mcp_logger = logging.getLogger("mcp_activity")
     mcp_file_handler = RotatingFileHandler(
         log_dir / "mcp_activity.log",
-        maxBytes=20 * 1024 * 1024,  # 20MB max file size
-        backupCount=5,  # Keep 5 rotated files (100MB total)
+        maxBytes=10 * 1024 * 1024,  # 20MB max file size
+        backupCount=2,  # Keep 5 rotated files (20MB total)
         encoding="utf-8",
     )
     mcp_file_handler.setLevel(logging.INFO)
@@ -153,64 +163,176 @@ except Exception as e:
 
 logger = logging.getLogger(__name__)
 
+
 # Create the MCP server instance with a unique name identifier
 # This name is used by MCP clients to identify and connect to this specific server
 server: Server = Server("zen-server")
+
+
+# Constants for tool filtering
+ESSENTIAL_TOOLS = {"version", "listmodels"}
+
+
+def parse_disabled_tools_env() -> set[str]:
+    """
+    Parse the DISABLED_TOOLS environment variable into a set of tool names.
+
+    Returns:
+        Set of lowercase tool names to disable, empty set if none specified
+    """
+    disabled_tools_env = os.getenv("DISABLED_TOOLS", "").strip()
+    if not disabled_tools_env:
+        return set()
+    return {t.strip().lower() for t in disabled_tools_env.split(",") if t.strip()}
+
+
+def validate_disabled_tools(disabled_tools: set[str], all_tools: dict[str, Any]) -> None:
+    """
+    Validate the disabled tools list and log appropriate warnings.
+
+    Args:
+        disabled_tools: Set of tool names requested to be disabled
+        all_tools: Dictionary of all available tool instances
+    """
+    essential_disabled = disabled_tools & ESSENTIAL_TOOLS
+    if essential_disabled:
+        logger.warning(f"Cannot disable essential tools: {sorted(essential_disabled)}")
+    unknown_tools = disabled_tools - set(all_tools.keys())
+    if unknown_tools:
+        logger.warning(f"Unknown tools in DISABLED_TOOLS: {sorted(unknown_tools)}")
+
+
+def apply_tool_filter(all_tools: dict[str, Any], disabled_tools: set[str]) -> dict[str, Any]:
+    """
+    Apply the disabled tools filter to create the final tools dictionary.
+
+    Args:
+        all_tools: Dictionary of all available tool instances
+        disabled_tools: Set of tool names to disable
+
+    Returns:
+        Dictionary containing only enabled tools
+    """
+    enabled_tools = {}
+    for tool_name, tool_instance in all_tools.items():
+        if tool_name in ESSENTIAL_TOOLS or tool_name not in disabled_tools:
+            enabled_tools[tool_name] = tool_instance
+        else:
+            logger.debug(f"Tool '{tool_name}' disabled via DISABLED_TOOLS")
+    return enabled_tools
+
+
+def log_tool_configuration(disabled_tools: set[str], enabled_tools: dict[str, Any]) -> None:
+    """
+    Log the final tool configuration for visibility.
+
+    Args:
+        disabled_tools: Set of tool names that were requested to be disabled
+        enabled_tools: Dictionary of tools that remain enabled
+    """
+    if not disabled_tools:
+        logger.info("All tools enabled (DISABLED_TOOLS not set)")
+        return
+    actual_disabled = disabled_tools - ESSENTIAL_TOOLS
+    if actual_disabled:
+        logger.debug(f"Disabled tools: {sorted(actual_disabled)}")
+        logger.info(f"Active tools: {sorted(enabled_tools.keys())}")
+
+
+def filter_disabled_tools(all_tools: dict[str, Any]) -> dict[str, Any]:
+    """
+    Filter tools based on DISABLED_TOOLS environment variable.
+
+    Args:
+        all_tools: Dictionary of all available tool instances
+
+    Returns:
+        dict: Filtered dictionary containing only enabled tools
+    """
+    disabled_tools = parse_disabled_tools_env()
+    if not disabled_tools:
+        log_tool_configuration(disabled_tools, all_tools)
+        return all_tools
+    validate_disabled_tools(disabled_tools, all_tools)
+    enabled_tools = apply_tool_filter(all_tools, disabled_tools)
+    log_tool_configuration(disabled_tools, enabled_tools)
+    return enabled_tools
+
 
 # Initialize the tool registry with all available AI-powered tools
 # Each tool provides specialized functionality for different development tasks
 # Tools are instantiated once and reused across requests (stateless design)
 TOOLS = {
-    "thinkdeep": ThinkDeepTool(),  # Extended reasoning for complex problems
-    "codereview": CodeReviewTool(),  # Comprehensive code review and quality analysis
-    "debug": DebugIssueTool(),  # Root cause analysis and debugging assistance
-    "analyze": AnalyzeTool(),  # General-purpose file and code analysis
     "chat": ChatTool(),  # Interactive development chat and brainstorming
-    "consensus": ConsensusTool(),  # Multi-model consensus for diverse perspectives on technical proposals
-    "listmodels": ListModelsTool(),  # List all available AI models by provider
-    "planner": PlannerTool(),  # A task or problem to plan out as several smaller steps
-    "precommit": Precommit(),  # Pre-commit validation of git changes
-    "testgen": TestGenerationTool(),  # Comprehensive test generation with edge case coverage
-    "refactor": RefactorTool(),  # Intelligent code refactoring suggestions with precise line references
+    "thinkdeep": ThinkDeepTool(),  # Step-by-step deep thinking workflow with expert analysis
+    "planner": PlannerTool(),  # Interactive sequential planner using workflow architecture
+    "consensus": ConsensusTool(),  # Step-by-step consensus workflow with multi-model analysis
+    "codereview": CodeReviewTool(),  # Comprehensive step-by-step code review workflow with expert analysis
+    "precommit": PrecommitTool(),  # Step-by-step pre-commit validation workflow
+    "debug": DebugIssueTool(),  # Root cause analysis and debugging assistance
+    "secaudit": SecauditTool(),  # Comprehensive security audit with OWASP Top 10 and compliance coverage
+    "docgen": DocgenTool(),  # Step-by-step documentation generation with complexity analysis
+    "analyze": AnalyzeTool(),  # General-purpose file and code analysis
+    "refactor": RefactorTool(),  # Step-by-step refactoring analysis workflow with expert validation
     "tracer": TracerTool(),  # Static call path prediction and control flow analysis
+    "testgen": TestGenTool(),  # Step-by-step test generation workflow with expert validation
+    "challenge": ChallengeTool(),  # Critical challenge prompt wrapper to avoid automatic agreement
+    "listmodels": ListModelsTool(),  # List all available AI models by provider
+    "version": VersionTool(),  # Display server version and system information
 }
+TOOLS = filter_disabled_tools(TOOLS)
 
 # Rich prompt templates for all tools
 PROMPT_TEMPLATES = {
+    "chat": {
+        "name": "chat",
+        "description": "Chat and brainstorm ideas",
+        "template": "Chat with {model} about this",
+    },
     "thinkdeep": {
         "name": "thinkdeeper",
-        "description": "Think deeply about the current context or problem",
-        "template": "Think deeper about this with {model} using {thinking_mode} thinking mode",
+        "description": "Step-by-step deep thinking workflow with expert analysis",
+        "template": "Start comprehensive deep thinking workflow with {model} using {thinking_mode} thinking mode",
+    },
+    "planner": {
+        "name": "planner",
+        "description": "Break down complex ideas, problems, or projects into multiple manageable steps",
+        "template": "Create a detailed plan with {model}",
+    },
+    "consensus": {
+        "name": "consensus",
+        "description": "Step-by-step consensus workflow with multi-model analysis",
+        "template": "Start comprehensive consensus workflow with {model}",
     },
     "codereview": {
         "name": "review",
         "description": "Perform a comprehensive code review",
         "template": "Perform a comprehensive code review with {model}",
     },
+    "precommit": {
+        "name": "precommit",
+        "description": "Step-by-step pre-commit validation workflow",
+        "template": "Start comprehensive pre-commit validation workflow with {model}",
+    },
     "debug": {
         "name": "debug",
         "description": "Debug an issue or error",
         "template": "Help debug this issue with {model}",
     },
+    "secaudit": {
+        "name": "secaudit",
+        "description": "Comprehensive security audit with OWASP Top 10 coverage",
+        "template": "Perform comprehensive security audit with {model}",
+    },
+    "docgen": {
+        "name": "docgen",
+        "description": "Generate comprehensive code documentation with complexity analysis",
+        "template": "Generate comprehensive documentation with {model}",
+    },
     "analyze": {
         "name": "analyze",
         "description": "Analyze files and code structure",
         "template": "Analyze these files with {model}",
-    },
-    "chat": {
-        "name": "chat",
-        "description": "Chat and brainstorm ideas",
-        "template": "Chat with {model} about this",
-    },
-    "precommit": {
-        "name": "precommit",
-        "description": "Validate changes before committing",
-        "template": "Run precommit validation with {model}",
-    },
-    "testgen": {
-        "name": "testgen",
-        "description": "Generate comprehensive tests",
-        "template": "Generate comprehensive tests with {model}",
     },
     "refactor": {
         "name": "refactor",
@@ -222,15 +344,25 @@ PROMPT_TEMPLATES = {
         "description": "Trace code execution paths",
         "template": "Generate tracer analysis with {model}",
     },
-    "planner": {
-        "name": "planner",
-        "description": "Break down complex ideas, problems, or projects into multiple manageable steps",
-        "template": "Create a detailed plan with {model}",
+    "testgen": {
+        "name": "testgen",
+        "description": "Generate comprehensive tests",
+        "template": "Generate comprehensive tests with {model}",
+    },
+    "challenge": {
+        "name": "challenge",
+        "description": "Challenge a statement critically without automatic agreement",
+        "template": "Challenge this statement critically",
     },
     "listmodels": {
         "name": "listmodels",
         "description": "List available AI models",
         "template": "List all available models",
+    },
+    "version": {
+        "name": "version",
+        "description": "Show server version and system information",
+        "template": "Show Zen MCP Server version",
     },
 }
 
@@ -245,9 +377,17 @@ def configure_providers():
     Raises:
         ValueError: If no valid API keys are found or conflicting configurations detected
     """
+    # Log environment variable status for debugging
+    logger.debug("Checking environment variables for API keys...")
+    api_keys_to_check = ["OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY", "CUSTOM_API_URL"]
+    for key in api_keys_to_check:
+        value = os.getenv(key)
+        logger.debug(f"  {key}: {'[PRESENT]' if value else '[MISSING]'}")
     from providers import ModelProviderRegistry
+    from providers.azure_openai import AzureOpenAIModelProvider
     from providers.base import ProviderType
     from providers.custom import CustomProvider
+    from providers.dial import DIALModelProvider
     from providers.gemini import GeminiModelProvider
     from providers.openai_provider import OpenAIModelProvider
     from providers.openrouter import OpenRouterProvider
@@ -266,12 +406,33 @@ def configure_providers():
         has_native_apis = True
         logger.info("Gemini API key found - Gemini models available")
 
-    # Check for OpenAI API key
+    # Check for Azure OpenAI configuration
+    azure_openai_resource = os.getenv("AZURE_OPENAI_RESOURCE_NAME")
+    azure_openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_openai_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_openai_configured = bool((azure_openai_resource or azure_openai_endpoint) and azure_openai_key)
+    if azure_openai_configured:
+        valid_providers.append("Azure OpenAI (O3/O4-mini)")
+        has_native_apis = True
+        if azure_openai_endpoint:
+            logger.info(f"Azure OpenAI configured with endpoint: {azure_openai_endpoint}")
+        else:
+            logger.info(f"Azure OpenAI configured with resource: {azure_openai_resource}")
+
+    # Check for OpenAI API key (skip if Azure is configured)
     openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key and openai_key != "your_openai_api_key_here":
+    logger.debug(f"OpenAI key check: key={'[PRESENT]' if openai_key else '[MISSING]'}")
+    if openai_key and openai_key != "your_openai_api_key_here" and not azure_openai_configured:
         valid_providers.append("OpenAI (o3)")
         has_native_apis = True
         logger.info("OpenAI API key found - o3 model available")
+    elif openai_key and azure_openai_configured:
+        logger.info("OpenAI API key found but Azure OpenAI is configured - using Azure OpenAI instead")
+    else:
+        if not openai_key:
+            logger.debug("OpenAI API key not found in environment")
+        else:
+            logger.debug("OpenAI API key is placeholder value")
 
     # Check for X.AI API key
     xai_key = os.getenv("XAI_API_KEY")
@@ -280,12 +441,25 @@ def configure_providers():
         has_native_apis = True
         logger.info("X.AI API key found - GROK models available")
 
+    # Check for DIAL API key
+    dial_key = os.getenv("DIAL_API_KEY")
+    if dial_key and dial_key != "your_dial_api_key_here":
+        valid_providers.append("DIAL")
+        has_native_apis = True
+        logger.info("DIAL API key found - DIAL models available")
+
     # Check for OpenRouter API key
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    logger.debug(f"OpenRouter key check: key={'[PRESENT]' if openrouter_key else '[MISSING]'}")
     if openrouter_key and openrouter_key != "your_openrouter_api_key_here":
         valid_providers.append("OpenRouter")
         has_openrouter = True
         logger.info("OpenRouter API key found - Multiple models available via OpenRouter")
+    else:
+        if not openrouter_key:
+            logger.debug("OpenRouter API key not found in environment")
+        else:
+            logger.debug("OpenRouter API key is placeholder value")
 
     # Check for custom API endpoint (Ollama, vLLM, etc.)
     custom_url = os.getenv("CUSTOM_API_URL")
@@ -309,10 +483,15 @@ def configure_providers():
     if has_native_apis:
         if gemini_key and gemini_key != "your_gemini_api_key_here":
             ModelProviderRegistry.register_provider(ProviderType.GOOGLE, GeminiModelProvider)
-        if openai_key and openai_key != "your_openai_api_key_here":
+        if azure_openai_configured:
+            ModelProviderRegistry.register_provider(ProviderType.AZURE_OPENAI, AzureOpenAIModelProvider)
+        elif openai_key and openai_key != "your_openai_api_key_here":
+            # Only register regular OpenAI if Azure is not configured
             ModelProviderRegistry.register_provider(ProviderType.OPENAI, OpenAIModelProvider)
         if xai_key and xai_key != "your_xai_api_key_here":
             ModelProviderRegistry.register_provider(ProviderType.XAI, XAIModelProvider)
+        if dial_key and dial_key != "your_dial_api_key_here":
+            ModelProviderRegistry.register_provider(ProviderType.DIAL, DIALModelProvider)
 
     # 2. Custom provider second (for local/private models)
     if has_custom:
@@ -335,6 +514,7 @@ def configure_providers():
             "- GEMINI_API_KEY for Gemini models\n"
             "- OPENAI_API_KEY for OpenAI o3 model\n"
             "- XAI_API_KEY for X.AI GROK models\n"
+            "- DIAL_API_KEY for DIAL models\n"
             "- OPENROUTER_API_KEY for OpenRouter (multiple models)\n"
             "- CUSTOM_API_URL for local models (Ollama, vLLM, etc.)"
         )
@@ -353,6 +533,25 @@ def configure_providers():
     if len(priority_info) > 1:
         logger.info(f"Provider priority: {' → '.join(priority_info)}")
 
+    # Register cleanup function for providers
+    def cleanup_providers():
+        """Clean up all registered providers on shutdown."""
+        try:
+            registry = ModelProviderRegistry()
+            if hasattr(registry, "_initialized_providers"):
+                for provider in list(registry._initialized_providers.items()):
+                    try:
+                        if provider and hasattr(provider, "close"):
+                            provider.close()
+                    except Exception:
+                        # Logger might be closed during shutdown
+                        pass
+        except Exception:
+            # Silently ignore any errors during cleanup
+            pass
+
+    atexit.register(cleanup_providers)
+
     # Check and log model restrictions
     restriction_service = get_restriction_service()
     restrictions = restriction_service.get_restriction_summary()
@@ -367,7 +566,8 @@ def configure_providers():
 
         # Validate restrictions against known models
         provider_instances = {}
-        for provider_type in [ProviderType.GOOGLE, ProviderType.OPENAI]:
+        provider_types_to_validate = [ProviderType.GOOGLE, ProviderType.OPENAI, ProviderType.XAI, ProviderType.DIAL]
+        for provider_type in provider_types_to_validate:
             provider = ModelProviderRegistry.get_provider(provider_type)
             if provider:
                 provider_instances[provider_type] = provider
@@ -408,32 +608,43 @@ async def handle_list_tools() -> list[Tool]:
         List of Tool objects representing all available tools
     """
     logger.debug("MCP client requested tool list")
+
+    # Try to log client info if available (this happens early in the handshake)
+    try:
+        from utils.client_info import format_client_info, get_client_info_from_context
+
+        client_info = get_client_info_from_context(server)
+        if client_info:
+            formatted = format_client_info(client_info)
+            logger.info(f"MCP Client Connected: {formatted}")
+
+            # Log to activity file as well
+            try:
+                mcp_activity_logger = logging.getLogger("mcp_activity")
+                friendly_name = client_info.get("friendly_name", "Claude")
+                raw_name = client_info.get("name", "Unknown")
+                version = client_info.get("version", "Unknown")
+                mcp_activity_logger.info(f"MCP_CLIENT_INFO: {friendly_name} (raw={raw_name} v{version})")
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"Could not log client info during list_tools: {e}")
     tools = []
 
     # Add all registered AI-powered tools from the TOOLS registry
     for tool in TOOLS.values():
+        # Get optional annotations from the tool
+        annotations = tool.get_annotations()
+        tool_annotations = ToolAnnotations(**annotations) if annotations else None
+
         tools.append(
             Tool(
                 name=tool.name,
                 description=tool.description,
                 inputSchema=tool.get_input_schema(),
+                annotations=tool_annotations,
             )
         )
-
-    # Add utility tools that provide server metadata and configuration info
-    # These tools don't require AI processing but are useful for clients
-    tools.extend(
-        [
-            Tool(
-                name="version",
-                description=(
-                    "VERSION & CONFIGURATION - Get server version, configuration details, "
-                    "and list of available tools. Useful for debugging and understanding capabilities."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-        ]
-    )
 
     # Log cache efficiency info
     if os.getenv("OPENROUTER_API_KEY") and os.getenv("OPENROUTER_API_KEY") != "your_openrouter_api_key_here":
@@ -555,6 +766,12 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
         # Consensus tool handles its own model configuration validation
         # No special handling needed at server level
 
+        # Skip model resolution for tools that don't require models (e.g., planner)
+        if not tool.requires_model():
+            logger.debug(f"Tool {name} doesn't require model resolution - skipping model validation")
+            # Execute tool directly without model context
+            return await tool.execute(arguments)
+
         # Handle auto mode at MCP boundary - resolve to specific model
         if model_name.lower() == "auto":
             # Get tool category to determine appropriate model
@@ -618,13 +835,6 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
             pass
         return result
 
-    # Route to utility tools that provide server information
-    elif name == "version":
-        logger.info(f"Executing utility tool '{name}'")
-        result = await handle_version()
-        logger.info(f"Utility tool '{name}' execution completed")
-        return result
-
     # Handle unknown tool requests gracefully
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -634,6 +844,11 @@ def parse_model_option(model_string: str) -> tuple[str, Optional[str]]:
     """
     Parse model:option format into model name and option.
 
+    Handles different formats:
+    - OpenRouter models: preserve :free, :beta, :preview suffixes as part of model name
+    - Ollama/Custom models: split on : to extract tags like :latest
+    - Consensus stance: extract options like :for, :against
+
     Args:
         model_string: String that may contain "model:option" format
 
@@ -641,6 +856,17 @@ def parse_model_option(model_string: str) -> tuple[str, Optional[str]]:
         tuple: (model_name, option) where option may be None
     """
     if ":" in model_string and not model_string.startswith("http"):  # Avoid parsing URLs
+        # Check if this looks like an OpenRouter model (contains /)
+        if "/" in model_string and model_string.count(":") == 1:
+            # Could be openai/gpt-4:something - check what comes after colon
+            parts = model_string.split(":", 1)
+            suffix = parts[1].strip().lower()
+
+            # Known OpenRouter suffixes to preserve
+            if suffix in ["free", "beta", "preview"]:
+                return model_string.strip(), None
+
+        # For other patterns (Ollama tags, consensus stances), split normally
         parts = model_string.split(":", 1)
         model_name = parts[0].strip()
         model_option = parts[1].strip() if len(parts) > 1 else None
@@ -831,6 +1057,16 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
     # Create model context early to use for history building
     from utils.model_context import ModelContext
 
+    # Check if we should use the model from the previous conversation turn
+    model_from_args = arguments.get("model")
+    if not model_from_args and context.turns:
+        # Find the last assistant turn to get the model used
+        for turn in reversed(context.turns):
+            if turn.role == "assistant" and turn.model_name:
+                arguments["model"] = turn.model_name
+                logger.debug(f"[CONVERSATION_DEBUG] Using model from previous turn: {turn.model_name}")
+                break
+
     model_context = ModelContext.from_arguments(arguments)
 
     # Build conversation history with model-specific limits
@@ -868,7 +1104,10 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
 
     # Store the enhanced prompt in the prompt field
     enhanced_arguments["prompt"] = enhanced_prompt
+    # Store the original user prompt separately for size validation
+    enhanced_arguments["_original_user_prompt"] = original_prompt
     logger.debug("[CONVERSATION_DEBUG] Storing enhanced prompt in 'prompt' field")
+    logger.debug("[CONVERSATION_DEBUG] Storing original user prompt in '_original_user_prompt' field")
 
     # Calculate remaining token budget based on current model
     # (model_context was already created above for history building)
@@ -913,95 +1152,6 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
         pass
 
     return enhanced_arguments
-
-
-async def handle_version() -> list[TextContent]:
-    """
-    Get comprehensive version and configuration information about the server.
-
-    Provides details about the server version, configuration settings,
-    available tools, and runtime environment. Useful for debugging and
-    understanding the server's capabilities.
-
-    Returns:
-        Formatted text with version and configuration details
-    """
-    # Import thinking mode here to avoid circular imports
-    from config import DEFAULT_THINKING_MODE_THINKDEEP
-
-    # Gather comprehensive server information
-    version_info = {
-        "version": __version__,
-        "updated": __updated__,
-        "author": __author__,
-        "default_model": DEFAULT_MODEL,
-        "default_thinking_mode_thinkdeep": DEFAULT_THINKING_MODE_THINKDEEP,
-        "max_context_tokens": "Dynamic (model-specific)",
-        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "server_started": datetime.now().isoformat(),
-        "available_tools": list(TOOLS.keys()) + ["version"],
-    }
-
-    # Check configured providers and available models
-    from providers import ModelProviderRegistry
-    from providers.base import ProviderType
-
-    configured_providers = []
-    available_models = ModelProviderRegistry.get_available_models(respect_restrictions=True)
-
-    # Group models by provider
-    models_by_provider = {}
-    for model_name, provider_type in available_models.items():
-        if provider_type not in models_by_provider:
-            models_by_provider[provider_type] = []
-        models_by_provider[provider_type].append(model_name)
-
-    # Format provider information with actual available models
-    if ProviderType.GOOGLE in models_by_provider:
-        gemini_models = ", ".join(sorted(models_by_provider[ProviderType.GOOGLE]))
-        configured_providers.append(f"Gemini ({gemini_models})")
-    if ProviderType.OPENAI in models_by_provider:
-        openai_models = ", ".join(sorted(models_by_provider[ProviderType.OPENAI]))
-        configured_providers.append(f"OpenAI ({openai_models})")
-    if ProviderType.XAI in models_by_provider:
-        xai_models = ", ".join(sorted(models_by_provider[ProviderType.XAI]))
-        configured_providers.append(f"X.AI ({xai_models})")
-    if ProviderType.CUSTOM in models_by_provider:
-        custom_models = ", ".join(sorted(models_by_provider[ProviderType.CUSTOM]))
-        custom_url = os.getenv("CUSTOM_API_URL", "")
-        configured_providers.append(f"Custom API ({custom_url}) - Models: {custom_models}")
-    if ProviderType.OPENROUTER in models_by_provider:
-        # For OpenRouter, show a summary since there could be many models
-        openrouter_count = len(models_by_provider[ProviderType.OPENROUTER])
-        configured_providers.append(f"OpenRouter ({openrouter_count} models via conf/custom_models.json)")
-
-    # Format the information in a human-readable way
-    text = f"""Zen MCP Server v{__version__}
-Updated: {__updated__}
-Author: {__author__}
-
-Configuration:
-- Default Model: {DEFAULT_MODEL}
-- Default Thinking Mode (ThinkDeep): {DEFAULT_THINKING_MODE_THINKDEEP}
-- Max Context: Dynamic (model-specific)
-- Python: {version_info["python_version"]}
-- Started: {version_info["server_started"]}
-
-Configured Providers:
-{chr(10).join(f"  - {provider}" for provider in configured_providers)}
-
-Available Tools:
-{chr(10).join(f"  - {tool}" for tool in version_info["available_tools"])}
-
-All Available Models:
-{chr(10).join(f"  - {model}" for model in sorted(available_models.keys()))}
-
-For updates, visit: https://github.com/BeehiveInnovations/zen-mcp-server"""
-
-    # Create standardized tool output
-    tool_output = ToolOutput(status="success", content=text, content_type="text", metadata={"tool_name": "version"})
-
-    return [TextContent(type="text", text=tool_output.model_dump_json())]
 
 
 @server.list_prompts()
@@ -1175,6 +1325,9 @@ async def main():
     logger.info("Zen MCP Server starting up...")
     logger.info(f"Log level: {log_level}")
 
+    # Note: MCP client info will be logged during the protocol handshake
+    # (when handle_list_tools is called)
+
     # Log current model mode
     from config import IS_AUTO_MODE
 
@@ -1208,9 +1361,14 @@ async def main():
         )
 
 
-if __name__ == "__main__":
+def run():
+    """Console script entry point for zen-mcp-server."""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         # Handle graceful shutdown
         pass
+
+
+if __name__ == "__main__":
+    run()

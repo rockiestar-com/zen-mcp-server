@@ -80,8 +80,10 @@ class ConversationBaseTest(BaseSimulatorTest):
             if project_root not in sys.path:
                 sys.path.insert(0, project_root)
 
-            # Import tools from server
-            from server import TOOLS
+            # Import and configure providers first (this is what main() does)
+            from server import TOOLS, configure_providers
+
+            configure_providers()
 
             self._tools = TOOLS
             self.logger.debug(f"Imported {len(self._tools)} tools for in-process testing")
@@ -164,6 +166,8 @@ class ConversationBaseTest(BaseSimulatorTest):
             continuation_id = self._extract_continuation_id_from_response(response_text)
 
             self.logger.debug(f"Tool '{tool_name}' completed successfully in-process")
+            if self.verbose and response_text:
+                self.logger.debug(f"Response preview: {response_text[:500]}...")
             return response_text, continuation_id
 
         except Exception as e:
@@ -178,6 +182,10 @@ class ConversationBaseTest(BaseSimulatorTest):
 
             # Look for continuation_id in various places
             if isinstance(response_data, dict):
+                # Check top-level continuation_id (workflow tools)
+                if "continuation_id" in response_data:
+                    return response_data["continuation_id"]
+
                 # Check metadata
                 metadata = response_data.get("metadata", {})
                 if "thread_id" in metadata:
@@ -192,6 +200,21 @@ class ConversationBaseTest(BaseSimulatorTest):
                 follow_up = response_data.get("follow_up_request", {})
                 if follow_up and "continuation_id" in follow_up:
                     return follow_up["continuation_id"]
+
+                # Special case: files_required_to_continue may have nested content
+                if response_data.get("status") == "files_required_to_continue":
+                    content = response_data.get("content", "")
+                    if isinstance(content, str):
+                        try:
+                            # Try to parse nested JSON
+                            nested_data = json.loads(content)
+                            if isinstance(nested_data, dict):
+                                # Check for continuation in nested data
+                                follow_up = nested_data.get("follow_up_request", {})
+                                if follow_up and "continuation_id" in follow_up:
+                                    return follow_up["continuation_id"]
+                        except json.JSONDecodeError:
+                            pass
 
             return None
 

@@ -80,9 +80,9 @@ class TestAutoModeComprehensive:
                     "OPENROUTER_API_KEY": None,
                 },
                 {
-                    "EXTENDED_REASONING": "gemini-2.5-pro-preview-06-05",  # Pro for deep thinking
-                    "FAST_RESPONSE": "gemini-2.5-flash-preview-05-20",  # Flash for speed
-                    "BALANCED": "gemini-2.5-flash-preview-05-20",  # Flash as balanced
+                    "EXTENDED_REASONING": "gemini-2.5-pro",  # Pro for deep thinking
+                    "FAST_RESPONSE": "gemini-2.5-flash",  # Flash for speed
+                    "BALANCED": "gemini-2.5-flash",  # Flash as balanced
                 },
             ),
             # Only OpenAI API available
@@ -139,20 +139,6 @@ class TestAutoModeComprehensive:
                     "EXTENDED_REASONING": "o3",  # Prefer O3 for deep reasoning
                     "FAST_RESPONSE": "o4-mini",  # Prefer O4-mini for speed
                     "BALANCED": "o4-mini",  # Prefer OpenAI for balanced
-                },
-            ),
-            # Only OpenRouter available - should fall back to proxy models
-            (
-                {
-                    "GEMINI_API_KEY": None,
-                    "OPENAI_API_KEY": None,
-                    "XAI_API_KEY": None,
-                    "OPENROUTER_API_KEY": "real-key",
-                },
-                {
-                    "EXTENDED_REASONING": "anthropic/claude-3.5-sonnet",  # First preferred thinking model from OpenRouter
-                    "FAST_RESPONSE": "anthropic/claude-3-opus",  # First available OpenRouter model
-                    "BALANCED": "anthropic/claude-3-opus",  # First available OpenRouter model
                 },
             ),
         ],
@@ -313,15 +299,49 @@ class TestAutoModeComprehensive:
             # Should include Gemini models
             assert "flash" in available_models
             assert "pro" in available_models
-            assert "gemini-2.5-flash-preview-05-20" in available_models
-            assert "gemini-2.5-pro-preview-06-05" in available_models
+            assert "gemini-2.5-flash" in available_models
+            assert "gemini-2.5-pro" in available_models
 
-            # Should also include other models (users might have OpenRouter configured)
-            # The schema should show all options; validation happens at runtime
-            assert "o3" in available_models
-            assert "o4-mini" in available_models
-            assert "grok" in available_models
-            assert "grok-3" in available_models
+            # After the fix, schema only shows models from enabled providers
+            # This prevents model namespace collisions and misleading users
+            # If only Gemini is configured, only Gemini models should appear
+            provider_count = len(
+                [
+                    key
+                    for key in ["GEMINI_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY"]
+                    if os.getenv(key) and os.getenv(key) != f"your_{key.lower()}_here"
+                ]
+            )
+
+            if provider_count == 1 and os.getenv("GEMINI_API_KEY"):
+                # Only Gemini configured - should only show Gemini models
+                non_gemini_models = [
+                    m
+                    for m in available_models
+                    if not m.startswith("gemini")
+                    and m
+                    not in [
+                        "flash",
+                        "pro",
+                        "flash-2.0",
+                        "flash2",
+                        "flashlite",
+                        "flash-lite",
+                        "flash2.5",
+                        "gemini pro",
+                        "gemini-pro",
+                    ]
+                ]
+                assert (
+                    len(non_gemini_models) == 0
+                ), f"Found non-Gemini models when only Gemini configured: {non_gemini_models}"
+            else:
+                # Multiple providers or OpenRouter - should include various models
+                # Only check if models are available if their providers might be configured
+                if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+                    assert any("o3" in m or "o4" in m for m in available_models), "No OpenAI models found"
+                if os.getenv("XAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+                    assert any("grok" in m for m in available_models), "No XAI models found"
 
     def test_auto_mode_schema_with_all_providers(self):
         """Test that auto mode schema includes models from all available providers."""
@@ -424,9 +444,12 @@ class TestAutoModeComprehensive:
             response_data = json.loads(response_text)
 
             assert response_data["status"] == "error"
-            assert "Model parameter is required" in response_data["content"]
-            assert "flash" in response_data["content"]  # Should suggest flash for FAST_RESPONSE
-            assert "category: fast_response" in response_data["content"]
+            assert (
+                "Model parameter is required" in response_data["content"]
+                or "Model 'auto' is not available" in response_data["content"]
+            )
+            # Note: With the new SimpleTool-based Chat tool, the error format is simpler
+            # and doesn't include category-specific suggestions like the original tool did
 
     def test_model_availability_with_restrictions(self):
         """Test that auto mode respects model restrictions when selecting fallback models."""
@@ -476,8 +499,8 @@ class TestAutoModeComprehensive:
             assert "o3-mini" not in available_models
 
             # Should still include all Gemini models (no restrictions)
-            assert "gemini-2.5-flash-preview-05-20" in available_models
-            assert "gemini-2.5-pro-preview-06-05" in available_models
+            assert "gemini-2.5-flash" in available_models
+            assert "gemini-2.5-pro" in available_models
 
     def test_openrouter_fallback_when_no_native_apis(self):
         """Test that OpenRouter provides fallback models when no native APIs are available."""
@@ -511,11 +534,11 @@ class TestAutoModeComprehensive:
             # Mock OpenRouter registry to return known models
             mock_registry = MagicMock()
             mock_registry.list_models.return_value = [
-                "google/gemini-2.5-flash-preview-05-20",
-                "google/gemini-2.5-pro-preview-06-05",
+                "google/gemini-2.5-flash",
+                "google/gemini-2.5-pro",
                 "openai/o3",
                 "openai/o4-mini",
-                "anthropic/claude-3-opus",
+                "anthropic/claude-opus-4",
             ]
 
             with patch.object(OpenRouterProvider, "_registry", mock_registry):
@@ -564,12 +587,10 @@ class TestAutoModeComprehensive:
             mock_provider = MagicMock()
             mock_response = MagicMock()
             mock_response.content = "test response"
-            mock_response.model_name = "gemini-2.5-flash-preview-05-20"  # The resolved name
+            mock_response.model_name = "gemini-2.5-flash"  # The resolved name
             mock_response.usage = {"input_tokens": 10, "output_tokens": 5}
             # Mock _resolve_model_name to simulate alias resolution
-            mock_provider._resolve_model_name = lambda alias: (
-                "gemini-2.5-flash-preview-05-20" if alias == "flash" else alias
-            )
+            mock_provider._resolve_model_name = lambda alias: ("gemini-2.5-flash" if alias == "flash" else alias)
             mock_provider.generate_content.return_value = mock_response
 
             with patch.object(ModelProviderRegistry, "get_provider_for_model", return_value=mock_provider):

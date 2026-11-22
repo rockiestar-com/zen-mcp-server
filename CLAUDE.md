@@ -20,8 +20,17 @@ This script automatically runs:
 - Ruff linting with auto-fix
 - Black code formatting 
 - Import sorting with isort
-- Complete unit test suite
+- Complete unit test suite (excluding integration tests)
 - Verification that all checks pass 100%
+
+**Run Integration Tests (requires API keys):**
+```bash
+# Run integration tests that make real API calls
+./run_integration_tests.sh
+
+# Run integration tests + simulator tests
+./run_integration_tests.sh --with-simulator
+```
 
 ### Server Management
 
@@ -73,26 +82,34 @@ tail -n 100 logs/mcp_activity.log
 # Follow tool activity in real-time
 tail -f logs/mcp_activity.log
 
-# Use the dedicated log monitor (shows tool calls, completions, errors)
-python log_monitor.py
+# Use simple tail commands to monitor logs
+tail -f logs/mcp_activity.log | grep -E "(TOOL_CALL|TOOL_COMPLETED|ERROR|WARNING)"
 ```
 
-The `log_monitor.py` script provides a real-time view of:
-- Tool calls and completions
-- Conversation resumptions and context
-- Errors and warnings from all log files
-- File rotation handling
+#### Available Log Files
 
-#### All Available Log Files
+**Current log files (with proper rotation):**
 ```bash
-# Main server log (all activity)
+# Main server log (all activity including debug info) - 20MB max, 10 backups
 tail -f logs/mcp_server.log
 
-# Tool activity only (TOOL_CALL, TOOL_COMPLETED, etc.)
+# Tool activity only (TOOL_CALL, TOOL_COMPLETED, etc.) - 20MB max, 5 backups  
 tail -f logs/mcp_activity.log
+```
 
-# Debug information (if configured)
-tail -f logs/debug.log
+**For programmatic log analysis (used by tests):**
+```python
+# Import the LogUtils class from simulator tests
+from simulator_tests.log_utils import LogUtils
+
+# Get recent logs
+recent_logs = LogUtils.get_recent_server_logs(lines=500)
+
+# Check for errors
+errors = LogUtils.check_server_logs_for_errors()
+
+# Search for specific patterns
+matches = LogUtils.search_logs_for_pattern("TOOL_CALL.*debug")
 ```
 
 ### Testing
@@ -111,7 +128,28 @@ python communication_simulator_test.py
 python communication_simulator_test.py --verbose
 ```
 
-#### Run Individual Simulator Tests (Recommended)
+#### Quick Test Mode (Recommended for Time-Limited Testing)
+```bash
+# Run quick test mode - 6 essential tests that provide maximum functionality coverage
+python communication_simulator_test.py --quick
+
+# Run quick test mode with verbose output
+python communication_simulator_test.py --quick --verbose
+```
+
+**Quick mode runs these 6 essential tests:**
+- `cross_tool_continuation` - Cross-tool conversation memory testing (chat, thinkdeep, codereview, analyze, debug)
+- `conversation_chain_validation` - Core conversation threading and memory validation
+- `consensus_workflow_accurate` - Consensus tool with flash model and stance testing
+- `codereview_validation` - CodeReview tool with flash model and multi-step workflows
+- `planner_validation` - Planner tool with flash model and complex planning workflows
+- `token_allocation_validation` - Token allocation and conversation history buildup testing
+
+**Why these 6 tests:** They cover the core functionality including conversation memory (`utils/conversation_memory.py`), chat tool functionality, file processing and deduplication, model selection (flash/flashlite/o3), and cross-tool conversation workflows. These tests validate the most critical parts of the system in minimal time.
+
+**Note:** Some workflow tools (analyze, codereview, planner, consensus, etc.) require specific workflow parameters and may need individual testing rather than quick mode testing.
+
+#### Run Individual Simulator Tests (For Detailed Testing)
 ```bash
 # List all available tests
 python communication_simulator_test.py --list-tests
@@ -152,8 +190,8 @@ Available simulator tests include:
 
 #### Run Unit Tests Only
 ```bash
-# Run all unit tests
-python -m pytest tests/ -v
+# Run all unit tests (excluding integration tests that require API keys)
+python -m pytest tests/ -v -m "not integration"
 
 # Run specific test file
 python -m pytest tests/test_refactor.py -v
@@ -162,26 +200,61 @@ python -m pytest tests/test_refactor.py -v
 python -m pytest tests/test_refactor.py::TestRefactorTool::test_format_response -v
 
 # Run tests with coverage
-python -m pytest tests/ --cov=. --cov-report=html
+python -m pytest tests/ --cov=. --cov-report=html -m "not integration"
 ```
+
+#### Run Integration Tests (Uses Free Local Models)
+
+**Setup Requirements:**
+```bash
+# 1. Install Ollama (if not already installed)
+# Visit https://ollama.ai or use brew install ollama
+
+# 2. Start Ollama service
+ollama serve
+
+# 3. Pull a model (e.g., llama3.2)
+ollama pull llama3.2
+
+# 4. Set environment variable for custom provider
+export CUSTOM_API_URL="http://localhost:11434"
+```
+
+**Run Integration Tests:**
+```bash
+# Run integration tests that make real API calls to local models
+python -m pytest tests/ -v -m "integration"
+
+# Run specific integration test
+python -m pytest tests/test_prompt_regression.py::TestPromptIntegration::test_chat_normal_prompt -v
+
+# Run all tests (unit + integration)
+python -m pytest tests/ -v
+```
+
+**Note**: Integration tests use the local-llama model via Ollama, which is completely FREE to run unlimited times. Requires `CUSTOM_API_URL` environment variable set to your local Ollama endpoint. They can be run safely in CI/CD but are excluded from code quality checks to keep them fast.
 
 ### Development Workflow
 
 #### Before Making Changes
-1. Ensure virtual environment is activated: `source venv/bin/activate`
+1. Ensure virtual environment is activated: `source .zen_venv/bin/activate`
 2. Run quality checks: `./code_quality_checks.sh`
 3. Check logs to ensure server is healthy: `tail -n 50 logs/mcp_server.log`
 
 #### After Making Changes
 1. Run quality checks again: `./code_quality_checks.sh`
-2. Run relevant simulator tests: `python communication_simulator_test.py --individual <test_name>`
-3. Check logs for any issues: `tail -n 100 logs/mcp_server.log`
-4. Restart Claude session to use updated code
+2. Run integration tests locally: `./run_integration_tests.sh`
+3. Run quick test mode for fast validation: `python communication_simulator_test.py --quick`
+4. Run relevant specific simulator tests if needed: `python communication_simulator_test.py --individual <test_name>`
+5. Check logs for any issues: `tail -n 100 logs/mcp_server.log`
+6. Restart Claude session to use updated code
 
 #### Before Committing/PR
 1. Final quality check: `./code_quality_checks.sh`
-2. Run full simulator test suite: `python communication_simulator_test.py`
-3. Verify all tests pass 100%
+2. Run integration tests: `./run_integration_tests.sh`
+3. Run quick test mode: `python communication_simulator_test.py --quick`
+4. Run full simulator test suite (optional): `./run_integration_tests.sh --with-simulator`
+5. Verify all tests pass 100%
 
 ### Common Troubleshooting
 
@@ -200,6 +273,9 @@ which python
 
 #### Test Failures
 ```bash
+# First try quick test mode to see if it's a general issue
+python communication_simulator_test.py --quick --verbose
+
 # Run individual failing test with verbose output
 python communication_simulator_test.py --individual <test_name> --verbose
 

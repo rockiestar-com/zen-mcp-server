@@ -281,36 +281,32 @@ class OpenAICompatibleProvider(ModelProvider):
             content = message.get("content", "")
 
             if role == "system":
-                # System messages can be treated as user messages for o3-pro
-                input_messages.append(
-                    {"role": "user", "content": [{"type": "input_text", "text": f"System: {content}"}]}
-                )
+                # For o3-pro, system messages should be handled carefully to avoid policy violations
+                # Instead of prefixing with "System:", we'll include the system content naturally
+                input_messages.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
             elif role == "user":
                 input_messages.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
             elif role == "assistant":
                 input_messages.append({"role": "assistant", "content": [{"type": "output_text", "text": content}]})
 
+        # Extract and validate reasoning effort
+        reasoning_effort = self._get_validated_reasoning_effort(kwargs)
+
         # Prepare completion parameters for responses endpoint
+        # Based on OpenAI documentation, use nested reasoning object for responses endpoint
         completion_params = {
             "model": model_name,
             "input": input_messages,
-            "text": {"format": {"type": "text"}},
-            "reasoning": {"effort": "medium", "summary": "auto"},
-            "tools": [],
+            "reasoning": {"effort": reasoning_effort},  # Use configurable reasoning effort
             "store": True,
         }
 
-        # Temperature is not in the documented parameters for responses endpoint
-        # but we'll try to add it in case it's supported
-
-        # Add max tokens if specified
+        # Add max tokens if specified (using max_completion_tokens for responses endpoint)
         if max_output_tokens:
-            completion_params["max_tokens"] = max_output_tokens
+            completion_params["max_completion_tokens"] = max_output_tokens
 
-        # Add any additional OpenAI-specific parameters
-        for key, value in kwargs.items():
-            if key in ["top_p", "frequency_penalty", "presence_penalty", "seed", "stop"]:
-                completion_params[key] = value
+        # For responses endpoint, we only add parameters that are explicitly supported
+        # Remove unsupported chat completion parameters that may cause API errors
 
         # Retry logic with progressive delays
         max_retries = 4
@@ -318,7 +314,13 @@ class OpenAICompatibleProvider(ModelProvider):
         last_exception = None
 
         for attempt in range(max_retries):
-            try:
+            try:  # Log the exact payload being sent for debugging
+                import json
+
+                logging.info(
+                    f"o3-pro API request payload: {json.dumps(completion_params, indent=2, ensure_ascii=False)}"
+                )
+
                 # Use OpenAI client's responses endpoint
                 response = self.client.responses.create(**completion_params)
 
@@ -379,7 +381,8 @@ class OpenAICompatibleProvider(ModelProvider):
                     break
 
         # If we get here, all retries failed
-        error_msg = f"o3-pro responses endpoint error after {max_retries} attempts: {str(last_exception)}"
+        actual_attempts = attempt + 1  # Convert from 0-based index to human-readable count
+        error_msg = f"o3-pro responses endpoint error after {actual_attempts} attempt{'s' if actual_attempts > 1 else ''}: {str(last_exception)}"
         logging.error(error_msg)
         raise RuntimeError(error_msg) from last_exception
 
@@ -410,8 +413,13 @@ class OpenAICompatibleProvider(ModelProvider):
         if not self.validate_model_name(model_name):
             raise ValueError(f"Model '{model_name}' not in allowed models list. Allowed models: {self.allowed_models}")
 
-        # Validate parameters
-        self.validate_parameters(model_name, temperature)
+        # Get effective temperature for this model
+        effective_temperature = self.get_effective_temperature(model_name, temperature)
+
+        # Only validate if temperature is not None (meaning the model supports it)
+        if effective_temperature is not None:
+            # Validate parameters with the effective temperature
+            self.validate_parameters(model_name, effective_temperature)
 
         # Prepare messages
         messages = []
@@ -448,23 +456,43 @@ class OpenAICompatibleProvider(ModelProvider):
         completion_params = {
             "model": model_name,
             "messages": messages,
-            "temperature": temperature,
         }
 
-        # Add max tokens if specified
-        if max_output_tokens:
+        # Check model capabilities once to determine parameter support
+        resolved_model = self._resolve_model_name(model_name)
+
+        # Use the effective temperature we calculated earlier
+        if effective_temperature is not None:
+            completion_params["temperature"] = effective_temperature
+            supports_temperature = True
+        else:
+            # Model doesn't support temperature
+            supports_temperature = False
+
+        # Add max tokens if specified and model supports it
+        # O3/O4 models that don't support temperature also don't support max_tokens
+        if max_output_tokens and supports_temperature:
             completion_params["max_tokens"] = max_output_tokens
 
+        # Add reasoning effort for O3 models (not just O3-pro)
+        if resolved_model.startswith("o3") or resolved_model.startswith("o4"):
+            # O3/O4 models support reasoning effort in chat completions
+            reasoning_effort = self._get_validated_reasoning_effort(kwargs)
+            completion_params["reasoning_effort"] = reasoning_effort
+
         # Add any additional OpenAI-specific parameters
+        # Use capabilities to filter parameters for reasoning models
         for key, value in kwargs.items():
             if key in ["top_p", "frequency_penalty", "presence_penalty", "seed", "stop", "stream"]:
+                # Reasoning models (those that don't support temperature) also don't support these parameters
+                if not supports_temperature and key in ["top_p", "frequency_penalty", "presence_penalty"]:
+                    continue  # Skip unsupported parameters for reasoning models
                 completion_params[key] = value
+            elif key == "reasoning_effort":
+                # Already handled above for O3/O4 models
+                continue
 
         # Check if this is o3-pro and needs the responses endpoint
-        resolved_model = model_name
-        if hasattr(self, "_resolve_model_name"):
-            resolved_model = self._resolve_model_name(model_name)
-
         if resolved_model == "o3-pro-2025-06-10":
             # This model requires the /v1/responses endpoint
             # If it fails, we should not fall back to chat/completions
@@ -525,9 +553,8 @@ class OpenAICompatibleProvider(ModelProvider):
                 time.sleep(delay)
 
         # If we get here, all retries failed
-        error_msg = (
-            f"{self.FRIENDLY_NAME} API error for model {model_name} after {max_retries} attempts: {str(last_exception)}"
-        )
+        actual_attempts = attempt + 1  # Convert from 0-based index to human-readable count
+        error_msg = f"{self.FRIENDLY_NAME} API error for model {model_name} after {actual_attempts} attempt{'s' if actual_attempts > 1 else ''}: {str(last_exception)}"
         logging.error(error_msg)
         raise RuntimeError(error_msg) from last_exception
 
@@ -673,12 +700,39 @@ class OpenAICompatibleProvider(ModelProvider):
             "o3-mini",
             "o3-pro",
             "o4-mini",
-            "o4-mini-high",
             # Note: Claude models would be handled by a separate provider
         }
         supports = model_name.lower() in vision_models
         logging.debug(f"Model '{model_name}' vision support: {supports}")
         return supports
+
+    def _get_validated_reasoning_effort(self, kwargs: dict) -> str:
+        """Extract and validate reasoning effort from kwargs or environment.
+
+        Args:
+            kwargs: Keyword arguments that may contain reasoning_effort
+
+        Returns:
+            Valid reasoning effort value ('low', 'medium', or 'high')
+        """
+        # Extract reasoning effort from kwargs or environment variable
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if not reasoning_effort:
+            # Check for provider-specific or global default
+            provider_type = self.get_provider_type().value.upper()
+            reasoning_effort = os.getenv(f"{provider_type}_REASONING_EFFORT") or os.getenv(
+                "OPENAI_REASONING_EFFORT", "medium"
+            )
+
+        # Validate reasoning effort value
+        valid_efforts = ["low", "medium", "high"]
+        if reasoning_effort not in valid_efforts:
+            logging.warning(
+                f"Invalid reasoning effort '{reasoning_effort}', using 'medium'. Valid values: {valid_efforts}"
+            )
+            reasoning_effort = "medium"
+
+        return reasoning_effort
 
     def _is_error_retryable(self, error: Exception) -> bool:
         """Determine if an error should be retried based on structured error codes.

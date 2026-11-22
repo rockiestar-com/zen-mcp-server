@@ -1,7 +1,21 @@
 """
-Debug Issue tool - Root cause analysis and debugging assistance
+Debug tool - Systematic root cause analysis and debugging assistance
+
+This tool provides a structured workflow for investigating complex bugs and issues.
+It guides you through systematic investigation steps with forced pauses between each step
+to ensure thorough code examination before proceeding. The tool supports backtracking,
+hypothesis evolution, and expert analysis integration for comprehensive debugging.
+
+Key features:
+- Step-by-step investigation workflow with progress tracking
+- Context-aware file embedding (references during investigation, full content for analysis)
+- Automatic conversation threading and history preservation
+- Expert analysis integration with external models
+- Support for visual debugging with image context
+- Confidence-based workflow optimization
 """
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import Field
@@ -11,159 +25,164 @@ if TYPE_CHECKING:
 
 from config import TEMPERATURE_ANALYTICAL
 from systemprompts import DEBUG_ISSUE_PROMPT
+from tools.shared.base_models import WorkflowRequest
 
-from .base import BaseTool, ToolRequest
+from .workflow.base import WorkflowTool
 
-# Field descriptions to avoid duplication between Pydantic and JSON schema
-DEBUG_FIELD_DESCRIPTIONS = {
-    "prompt": (
-        "MANDATORY: You MUST first think deep about the issue, what it is, why it might be happening, what code might be involved, "
-        "is it an error stemming out of the code directly or is it a side-effect of some part of the existing code. If it's an error "
-        "message, could it be coming from an external resource and NOT directly from the project? What part of the code seems most likely"
-        "the culprit. MUST try and ZERO IN on the issue and surrounding code. Include all the details into the prompt that you can provide: "
-        "error messages, symptoms, when it occurs, steps to reproduce, environment details, "
-        "recent changes, and any other relevant information. Mention any previous attempts at fixing this issue, "
-        "including any past fix that was in place but has now regressed. "
-        "The more context available, the better the analysis. "
-        "PERFORM SYSTEMATIC INVESTIGATION: You MUST begin by thinking hard and performing a thorough investigation using a systematic approach. "
-        "First understand the issue, find the code that may be causing it or code that is breaking, as well as any related code that could have caused this as a side effect. "
-        "You MUST maintain detailed investigation notes in a DEBUGGING_{issue_description}.md file within the project folder, "
-        "updating it as it performs step-by-step analysis of the code, trying to determine the actual root cause and understanding how a minimal, appropriate fix can be found. "
-        "This file MUST contain functions, methods, files visited OR determined to be part of the problem. You MUST update this and remove any references that it finds to be irrelevant during its investigation. "
-        "CRITICAL: If after thorough investigation You has very high confidence that NO BUG EXISTS that correlates to the reported symptoms, "
-        "You should consider the possibility that the reported issue may not actually be present, may be a misunderstanding, or may be conflated with something else entirely. "
-        "In such cases, you should gather more information from the user through targeted questioning rather than continue hunting for non-existent bugs. "
-        "Once complete, you MUST provide also pass in this file into the files parameter of this tool. "
-        "It is ESSENTIAL that this detailed work is performed by you before sharing all the relevant details with its development assistant. This will greatly help in zeroing in on the root cause."
+logger = logging.getLogger(__name__)
+
+# Tool-specific field descriptions matching original debug tool
+DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS = {
+    "step": (
+        "Describe what you're currently investigating by thinking deeply about the issue and its possible causes. "
+        "In step 1, clearly state the issue and begin forming an investigative direction after thinking carefully"
+        "about the described problem. Ask further questions from the user if you think these will help with your"
+        "understanding and investigation. CRITICAL: Remember that reported symptoms might originate from code far from "
+        "where they manifest. Also be aware that after thorough investigation, you might find NO BUG EXISTS - it could "
+        "be a misunderstanding or expectation mismatch. Consider not only obvious failures, but also subtle "
+        "contributing factors like upstream logic, invalid inputs, missing preconditions, or hidden side effects. "
+        "Map out the flow of related functions or modules. Identify call paths where input values or branching logic "
+        "could cause instability. In concurrent systems, watch for race conditions, shared state, or timing "
+        "dependencies. In all later steps, continue exploring with precision: trace deeper dependencies, verify "
+        "hypotheses, and adapt your understanding as you uncover more evidence."
+    ),
+    "step_number": (
+        "The index of the current step in the investigation sequence, beginning at 1. Each step should build upon or "
+        "revise the previous one."
+    ),
+    "total_steps": (
+        "Your current estimate for how many steps will be needed to complete the investigation. "
+        "Adjust as new findings emerge."
+    ),
+    "next_step_required": (
+        "Set to true if you plan to continue the investigation with another step. False means you believe the root "
+        "cause is known or the investigation is complete."
     ),
     "findings": (
-        "You MUST first perform its own investigation, gather its findings and analysis. Include: steps taken to analyze the issue, "
-        "code patterns discovered, initial hypotheses formed, any relevant classes/functions/methods examined, "
-        "and any preliminary conclusions. If investigation yields no concrete evidence of a bug correlating to the reported symptoms, "
-        "You should clearly state this finding and consider that the issue may not exist as described. "
-        "This provides context for the assistant model's analysis."
+        "Summarize everything discovered in this step. Include new clues, unexpected behavior, evidence from code or "
+        "logs, or disproven theories. Be specific and avoid vague language—document what you now know and how it "
+        "affects your hypothesis. IMPORTANT: If you find no evidence supporting the reported issue after thorough "
+        "investigation, document this clearly. Finding 'no bug' is a valid outcome if the "
+        "investigation was comprehensive. "
+        "In later steps, confirm or disprove past findings with reason."
     ),
-    "files": (
-        "Essential files for debugging - ONLY include files that are directly related to the issue, "
-        "contain the problematic code, or are necessary for understanding the root cause. "
-        "This can include any relevant log files, error description documents, investigation documents, "
-        "Your own findings as a document, related code that may help with analysis."
-        "DO NOT include every file scanned during investigation (must be FULL absolute paths - DO NOT SHORTEN)."
+    "files_checked": (
+        "List all files (as absolute paths, do not clip or shrink file names) examined during "
+        "the investigation so far. "
+        "Include even files ruled out, as this tracks your exploration path."
     ),
-    "error_context": "Stack trace, snippet from logs, or additional error context. For very large text you MUST instead"
-    "save the context as a temporary file within the project folder and share it as a FULL absolute file path - DO NOT SHORTEN"
-    "reference to the files parameter.",
-    "images": "Optional images showing error screens, UI issues, logs displays, or visual debugging information",
+    "relevant_files": (
+        "Subset of files_checked (as full absolute paths) that contain code directly relevant to the issue. Only list "
+        "those that are directly tied to the root cause or its effects. This could include the cause, trigger, or "
+        "place of manifestation."
+    ),
+    "relevant_context": (
+        "List methods or functions that are central to the issue, in the format "
+        "'ClassName.methodName' or 'functionName'. "
+        "Prioritize those that influence or process inputs, drive branching, or pass state between modules."
+    ),
+    "hypothesis": (
+        "A concrete theory for what's causing the issue based on the evidence so far. This can include suspected "
+        "failures, incorrect assumptions, or violated constraints. VALID HYPOTHESES INCLUDE: 'No bug found - possible "
+        "user misunderstanding' or 'Symptoms appear unrelated to any code issue' if evidence supports this. When "
+        "no bug is found, consider suggesting: 'Recommend discussing with thought partner/engineering assistant for "
+        "clarification of expected behavior.' You are encouraged to revise or abandon hypotheses in later steps as "
+        "needed based on evidence."
+    ),
+    "confidence": (
+        "Indicate your current confidence in the hypothesis. Use: 'exploring' (starting out), 'low' (early idea), "
+        "'medium' (some supporting evidence), 'high' (strong evidence), 'very_high' (very strong evidence), "
+        "'almost_certain' (nearly confirmed), 'certain' (100% confidence - root cause and minimal fix are both "
+        "confirmed locally with no need for external model validation). Do NOT use 'certain' unless the issue can be "
+        "fully resolved with a fix, use 'very_high' or 'almost_certain' instead when not 100% sure. Using 'certain' "
+        "means you have complete confidence locally and prevents external model validation. Also do "
+        "NOT set confidence to 'certain' if the user has strongly requested that external validation MUST be performed."
+    ),
+    "backtrack_from_step": (
+        "If an earlier finding or hypothesis needs to be revised or discarded, specify the step number from which to "
+        "start over. Use this to acknowledge investigative dead ends and correct the course."
+    ),
+    "images": (
+        "Optional list of absolute paths to screenshots or UI visuals that clarify the issue. "
+        "Only include if they materially assist understanding or hypothesis formulation."
+    ),
 }
 
 
-class DebugIssueRequest(ToolRequest):
-    """Request model for debug tool"""
+class DebugInvestigationRequest(WorkflowRequest):
+    """Request model for debug investigation steps matching original debug tool exactly"""
 
-    prompt: str = Field(..., description=DEBUG_FIELD_DESCRIPTIONS["prompt"])
-    findings: Optional[str] = Field(None, description=DEBUG_FIELD_DESCRIPTIONS["findings"])
-    files: Optional[list[str]] = Field(None, description=DEBUG_FIELD_DESCRIPTIONS["files"])
-    error_context: Optional[str] = Field(None, description=DEBUG_FIELD_DESCRIPTIONS["error_context"])
-    images: Optional[list[str]] = Field(None, description=DEBUG_FIELD_DESCRIPTIONS["images"])
+    # Required fields for each investigation step
+    step: str = Field(..., description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["step"])
+    step_number: int = Field(..., description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["step_number"])
+    total_steps: int = Field(..., description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["total_steps"])
+    next_step_required: bool = Field(..., description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["next_step_required"])
+
+    # Investigation tracking fields
+    findings: str = Field(..., description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["findings"])
+    files_checked: list[str] = Field(
+        default_factory=list, description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["files_checked"]
+    )
+    relevant_files: list[str] = Field(
+        default_factory=list, description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["relevant_files"]
+    )
+    relevant_context: list[str] = Field(
+        default_factory=list, description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["relevant_context"]
+    )
+    hypothesis: Optional[str] = Field(None, description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["hypothesis"])
+    confidence: Optional[str] = Field("low", description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["confidence"])
+
+    # Optional backtracking field
+    backtrack_from_step: Optional[int] = Field(
+        None, description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["backtrack_from_step"]
+    )
+
+    # Optional images for visual debugging
+    images: Optional[list[str]] = Field(default=None, description=DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["images"])
+
+    # Override inherited fields to exclude them from schema (except model which needs to be available)
+    temperature: Optional[float] = Field(default=None, exclude=True)
+    thinking_mode: Optional[str] = Field(default=None, exclude=True)
+    use_websearch: Optional[bool] = Field(default=None, exclude=True)
 
 
-class DebugIssueTool(BaseTool):
-    """Advanced debugging and root cause analysis tool"""
+class DebugIssueTool(WorkflowTool):
+    """
+    Debug tool for systematic root cause analysis and issue investigation.
+
+    This tool implements a structured debugging workflow that guides users through
+    methodical investigation steps, ensuring thorough code examination and evidence
+    gathering before reaching conclusions. It supports complex debugging scenarios
+    including race conditions, memory leaks, performance issues, and integration problems.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.initial_issue = None
 
     def get_name(self) -> str:
         return "debug"
 
     def get_description(self) -> str:
         return (
-            "DEBUG & ROOT CAUSE ANALYSIS - Expert debugging for complex issues with systematic investigation support. "
-            "Use this when you need to debug code, find out why something is failing, identify root causes, "
-            "trace errors, or diagnose issues. "
-            "MANDATORY: Claud you MUST first think deep and follow these instructions when using this tool"
-            "SYSTEMATIC INVESTIGATION WORKFLOW: "
-            "You MUST begin by thinking hard and performing a thorough investigation using a systematic approach. "
-            "First understand the issue, find the code that may be causing it or code that is breaking, as well as any related code that could have caused this as a side effect. "
-            "You MUST maintain detailed investigation notes while it performs its analysis, "
-            "updating it as it performs step-by-step analysis of the code, trying to determine the actual root cause and understanding how a minimal, appropriate fix can be found. "
-            "This file MUST contain functions, methods, files visited OR determined to be part of the problem. You MUST update this and remove any references that it finds to be irrelevant during its investigation. "
-            "Once complete, You MUST provide Zen's debug tool with this file passed into the files parameter. "
-            "1. INVESTIGATE SYSTEMATICALLY: You MUST think and use a methodical approach to trace through error reports, "
-            "examine code, and gather evidence step by step "
-            "2. DOCUMENT FINDINGS: Maintain detailed investigation notes to "
-            "keep the user informed during its initial investigation. This investigation MUST be shared with this tool for the assistant "
-            "to be able to help more effectively. "
-            "3. USE TRACER TOOL: For complex method calls, class references, or side effects use Zen's tracer tool and include its output as part of the "
-            "prompt or additional context "
-            "4. COLLECT EVIDENCE: Document important discoveries and validation attempts "
-            "5. PROVIDE COMPREHENSIVE FINDINGS: Pass complete findings to this tool for expert analysis "
-            "INVESTIGATION METHODOLOGY: "
-            "- Start with error messages/symptoms and work backwards to root cause "
-            "- Examine code flow and identify potential failure points "
-            "- Use tracer tool for complex method interactions and dependencies if and as needed but continue with the investigation after using it "
-            "- Test hypotheses against actual code and logs and confirm the idea holds "
-            "- Document everything systematically "
-            "- CRITICAL: If investigation yields no concrete evidence of a bug, consider that the reported issue may not exist as described and gather more information through questioning "
-            "ESSENTIAL FILES ONLY: Include only files (documents, code etc) directly related to the issue. "
-            "Focus on quality over quantity for assistant model analysis. "
-            "STRUCTURED OUTPUT: Assistant models return JSON responses with hypothesis "
-            "ranking, evidence correlation, and actionable fixes. "
-            "Choose thinking_mode based on issue complexity: 'low' for simple errors, "
-            "'medium' for standard debugging (default), 'high' for complex system issues, "
-            "'max' for extremely challenging bugs requiring deepest analysis. "
-            "Note: If you're not currently using a top-tier model such as Opus 4 or above, these tools can provide enhanced capabilities."
+            "DEBUG & ROOT CAUSE ANALYSIS - Systematic self-investigation followed by expert analysis. "
+            "This tool guides you through a step-by-step investigation process where you:\n\n"
+            "1. Start with step 1: describe the issue to investigate\n"
+            "2. STOP and investigate using appropriate tools\n"
+            "3. Report findings in step 2 with concrete evidence from actual code\n"
+            "4. Continue investigating between each debug step\n"
+            "5. Track findings, relevant files, and methods throughout\n"
+            "6. Update hypotheses as understanding evolves\n"
+            "7. Once investigation is complete, receive expert analysis\n\n"
+            "IMPORTANT: This tool enforces investigation between steps:\n"
+            "- After each debug call, you MUST investigate before calling debug again\n"
+            "- Each step must include NEW evidence from code examination\n"
+            "- No recursive debug calls without actual investigation work\n"
+            "- The tool will specify which step number to use next\n"
+            "- Follow the required_actions list for investigation guidance\n\n"
+            "Perfect for: complex bugs, mysterious errors, performance issues, "
+            "race conditions, memory leaks, integration problems."
         )
-
-    def get_input_schema(self) -> dict[str, Any]:
-        schema = {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": DEBUG_FIELD_DESCRIPTIONS["prompt"],
-                },
-                "model": self.get_model_field_schema(),
-                "findings": {
-                    "type": "string",
-                    "description": DEBUG_FIELD_DESCRIPTIONS["findings"],
-                },
-                "files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": DEBUG_FIELD_DESCRIPTIONS["files"],
-                },
-                "error_context": {
-                    "type": "string",
-                    "description": DEBUG_FIELD_DESCRIPTIONS["error_context"],
-                },
-                "images": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": DEBUG_FIELD_DESCRIPTIONS["images"],
-                },
-                "temperature": {
-                    "type": "number",
-                    "description": "Temperature (0-1, default 0.2 for accuracy)",
-                    "minimum": 0,
-                    "maximum": 1,
-                },
-                "thinking_mode": {
-                    "type": "string",
-                    "enum": ["minimal", "low", "medium", "high", "max"],
-                    "description": "Thinking depth: minimal (0.5% of model max), low (8%), medium (33%), high (67%), max (100% of model max)",
-                },
-                "use_websearch": {
-                    "type": "boolean",
-                    "description": "Enable web search for documentation, best practices, and current information. Particularly useful for: brainstorming sessions, architectural design discussions, exploring industry best practices, working with specific frameworks/technologies, researching solutions to complex problems, or when current documentation and community insights would enhance the analysis.",
-                    "default": True,
-                },
-                "continuation_id": {
-                    "type": "string",
-                    "description": "Thread continuation ID for multi-turn conversations. Can be used to continue conversations across different tools. Only provide this if continuing a previous conversation thread.",
-                },
-            },
-            "required": ["prompt"] + (["model"] if self.is_effective_auto_mode() else []),
-        }
-
-        return schema
 
     def get_system_prompt(self) -> str:
         return DEBUG_ISSUE_PROMPT
@@ -171,147 +190,456 @@ class DebugIssueTool(BaseTool):
     def get_default_temperature(self) -> float:
         return TEMPERATURE_ANALYTICAL
 
-    # Line numbers are enabled by default from base class for precise error location
-
     def get_model_category(self) -> "ToolModelCategory":
         """Debug requires deep analysis and reasoning"""
         from tools.models import ToolModelCategory
 
         return ToolModelCategory.EXTENDED_REASONING
 
-    def get_request_model(self):
-        return DebugIssueRequest
+    def get_workflow_request_model(self):
+        """Return the debug-specific request model."""
+        return DebugInvestigationRequest
 
-    async def prepare_prompt(self, request: DebugIssueRequest) -> str:
-        """Prepare the debugging prompt"""
-        # Check for prompt.txt in files
-        prompt_content, updated_files = self.handle_prompt_file(request.files)
+    def get_input_schema(self) -> dict[str, Any]:
+        """Generate input schema using WorkflowSchemaBuilder with debug-specific overrides."""
+        from .workflow.schema_builders import WorkflowSchemaBuilder
 
-        # If prompt.txt was found, use it as prompt or error_context
-        if prompt_content:
-            if not request.prompt or request.prompt == "":
-                request.prompt = prompt_content
-            else:
-                request.error_context = prompt_content
+        # Debug-specific field overrides
+        debug_field_overrides = {
+            "step": {
+                "type": "string",
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["step"],
+            },
+            "step_number": {
+                "type": "integer",
+                "minimum": 1,
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["step_number"],
+            },
+            "total_steps": {
+                "type": "integer",
+                "minimum": 1,
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["total_steps"],
+            },
+            "next_step_required": {
+                "type": "boolean",
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["next_step_required"],
+            },
+            "findings": {
+                "type": "string",
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["findings"],
+            },
+            "files_checked": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["files_checked"],
+            },
+            "relevant_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["relevant_files"],
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["exploring", "low", "medium", "high", "very_high", "almost_certain", "certain"],
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["confidence"],
+            },
+            "hypothesis": {
+                "type": "string",
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["hypothesis"],
+            },
+            "backtrack_from_step": {
+                "type": "integer",
+                "minimum": 1,
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["backtrack_from_step"],
+            },
+            "images": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": DEBUG_INVESTIGATION_FIELD_DESCRIPTIONS["images"],
+            },
+        }
 
-        # Check user input sizes at MCP transport boundary (before adding internal content)
-        size_check = self.check_prompt_size(request.prompt)
-        if size_check:
-            from tools.models import ToolOutput
+        # Use WorkflowSchemaBuilder with debug-specific tool fields
+        return WorkflowSchemaBuilder.build_schema(
+            tool_specific_fields=debug_field_overrides,
+            model_field_schema=self.get_model_field_schema(),
+            auto_mode=self.is_effective_auto_mode(),
+            tool_name=self.get_name(),
+        )
 
-            raise ValueError(f"MCP_SIZE_CHECK:{ToolOutput(**size_check).model_dump_json()}")
+    def get_required_actions(self, step_number: int, confidence: str, findings: str, total_steps: int) -> list[str]:
+        """Define required actions for each investigation phase."""
+        if step_number == 1:
+            # Initial investigation tasks
+            return [
+                "Search for code related to the reported issue or symptoms",
+                "Examine relevant files and understand the current implementation",
+                "Understand the project structure and locate relevant modules",
+                "Identify how the affected functionality is supposed to work",
+            ]
+        elif confidence in ["exploring", "low"]:
+            # Need deeper investigation
+            return [
+                "Examine the specific files you've identified as relevant",
+                "Trace method calls and data flow through the system",
+                "Check for edge cases, boundary conditions, and assumptions in the code",
+                "Look for related configuration, dependencies, or external factors",
+            ]
+        elif confidence in ["medium", "high", "very_high"]:
+            # Close to root cause - need confirmation
+            return [
+                "Examine the exact code sections where you believe the issue occurs",
+                "Trace the execution path that leads to the failure",
+                "Verify your hypothesis with concrete code evidence",
+                "Check for any similar patterns elsewhere in the codebase",
+            ]
+        elif confidence == "almost_certain":
+            # Almost certain - final verification before conclusion
+            return [
+                "Finalize your root cause analysis with specific evidence",
+                "Document the complete chain of causation from symptom to root cause",
+                "Verify the minimal fix approach is correct",
+                "Consider if expert analysis would provide additional insights",
+            ]
+        else:
+            # General investigation needed
+            return [
+                "Continue examining the code paths identified in your hypothesis",
+                "Gather more evidence using appropriate investigation tools",
+                "Test edge cases and boundary conditions",
+                "Look for patterns that confirm or refute your theory",
+            ]
 
-        if request.error_context:
-            size_check = self.check_prompt_size(request.error_context)
-            if size_check:
-                from tools.models import ToolOutput
+    def should_call_expert_analysis(self, consolidated_findings, request=None) -> bool:
+        """
+        Decide when to call external model based on investigation completeness.
 
-                raise ValueError(f"MCP_SIZE_CHECK:{ToolOutput(**size_check).model_dump_json()}")
+        Don't call expert analysis if the CLI agent has certain confidence - trust their judgment.
+        """
+        # Check if user requested to skip assistant model
+        if request and not self.get_request_use_assistant_model(request):
+            return False
 
-        # Update request files list
-        if updated_files is not None:
-            request.files = updated_files
+        # Check if we have meaningful investigation data
+        return (
+            len(consolidated_findings.relevant_files) > 0
+            or len(consolidated_findings.findings) >= 2
+            or len(consolidated_findings.issues_found) > 0
+        )
 
-        # File size validation happens at MCP boundary in server.py
+    def prepare_expert_analysis_context(self, consolidated_findings) -> str:
+        """Prepare context for external model call matching original debug tool format."""
+        context_parts = [
+            f"=== ISSUE DESCRIPTION ===\n{self.initial_issue or 'Investigation initiated'}\n=== END DESCRIPTION ==="
+        ]
 
-        # Build context sections
-        context_parts = [f"=== ISSUE DESCRIPTION ===\n{request.prompt}\n=== END DESCRIPTION ==="]
-
-        if request.findings:
-            context_parts.append(f"\n=== CLAUDE'S INVESTIGATION FINDINGS ===\n{request.findings}\n=== END FINDINGS ===")
-
-        if request.error_context:
-            context_parts.append(f"\n=== ERROR CONTEXT/STACK TRACE ===\n{request.error_context}\n=== END CONTEXT ===")
-
-        # Add relevant files if provided
-        if request.files:
-            # Use centralized file processing logic
-            continuation_id = getattr(request, "continuation_id", None)
-            file_content, processed_files = self._prepare_file_content_for_prompt(
-                request.files, continuation_id, "Code"
+        # Add special note if confidence is almost_certain
+        if consolidated_findings.confidence == "almost_certain":
+            context_parts.append(
+                "\n=== IMPORTANT: ALMOST CERTAIN CONFIDENCE ===\n"
+                "The agent has reached 'almost_certain' confidence but has NOT confirmed the bug with 100% certainty. "
+                "Your role is to:\n"
+                "1. Validate the agent's hypothesis and investigation\n"
+                "2. Identify any missing evidence or overlooked aspects\n"
+                "3. Provide additional insights that could confirm or refute the hypothesis\n"
+                "4. Help finalize the root cause analysis with complete certainty\n"
+                "=== END IMPORTANT ==="
             )
-            self._actually_processed_files = processed_files
 
+        # Add investigation summary
+        investigation_summary = self._build_investigation_summary(consolidated_findings)
+        context_parts.append(f"\n=== AGENT'S INVESTIGATION FINDINGS ===\n{investigation_summary}\n=== END FINDINGS ===")
+
+        # Add error context if available
+        error_context = self._extract_error_context(consolidated_findings)
+        if error_context:
+            context_parts.append(f"\n=== ERROR CONTEXT/STACK TRACE ===\n{error_context}\n=== END CONTEXT ===")
+
+        # Add relevant methods/functions if available
+        if consolidated_findings.relevant_context:
+            methods_text = "\n".join(f"- {method}" for method in consolidated_findings.relevant_context)
+            context_parts.append(f"\n=== RELEVANT METHODS/FUNCTIONS ===\n{methods_text}\n=== END METHODS ===")
+
+        # Add hypothesis evolution if available
+        if consolidated_findings.hypotheses:
+            hypotheses_text = "\n".join(
+                f"Step {h['step']} ({h['confidence']} confidence): {h['hypothesis']}"
+                for h in consolidated_findings.hypotheses
+            )
+            context_parts.append(f"\n=== HYPOTHESIS EVOLUTION ===\n{hypotheses_text}\n=== END HYPOTHESES ===")
+
+        # Add images if available
+        if consolidated_findings.images:
+            images_text = "\n".join(f"- {img}" for img in consolidated_findings.images)
+            context_parts.append(
+                f"\n=== VISUAL DEBUGGING INFORMATION ===\n{images_text}\n=== END VISUAL INFORMATION ==="
+            )
+
+        # Add file content if we have relevant files
+        if consolidated_findings.relevant_files:
+            file_content, _ = self._prepare_file_content_for_prompt(
+                list(consolidated_findings.relevant_files), None, "Essential debugging files"
+            )
             if file_content:
                 context_parts.append(
                     f"\n=== ESSENTIAL FILES FOR DEBUGGING ===\n{file_content}\n=== END ESSENTIAL FILES ==="
                 )
 
-        full_context = "\n".join(context_parts)
+        return "\n".join(context_parts)
 
-        # Check token limits
-        self._validate_token_limit(full_context, "Context")
+    def _build_investigation_summary(self, consolidated_findings) -> str:
+        """Prepare a comprehensive summary of the investigation."""
+        summary_parts = [
+            "=== SYSTEMATIC INVESTIGATION SUMMARY ===",
+            f"Total steps: {len(consolidated_findings.findings)}",
+            f"Files examined: {len(consolidated_findings.files_checked)}",
+            f"Relevant files identified: {len(consolidated_findings.relevant_files)}",
+            f"Methods/functions involved: {len(consolidated_findings.relevant_context)}",
+            "",
+            "=== INVESTIGATION PROGRESSION ===",
+        ]
 
-        # Add web search instruction if enabled
-        websearch_instruction = self.get_websearch_instruction(
-            request.use_websearch,
-            """When debugging issues, consider if searches for these would help:
-- The exact error message to find known solutions
-- Framework-specific error codes and their meanings
-- Similar issues in forums, GitHub issues, or Stack Overflow
-- Workarounds and patches for known bugs
-- Version-specific issues and compatibility problems""",
+        for finding in consolidated_findings.findings:
+            summary_parts.append(finding)
+
+        return "\n".join(summary_parts)
+
+    def _extract_error_context(self, consolidated_findings) -> Optional[str]:
+        """Extract error context from investigation findings."""
+        error_patterns = ["error", "exception", "stack trace", "traceback", "failure"]
+        error_context_parts = []
+
+        for finding in consolidated_findings.findings:
+            if any(pattern in finding.lower() for pattern in error_patterns):
+                error_context_parts.append(finding)
+
+        return "\n".join(error_context_parts) if error_context_parts else None
+
+    def get_step_guidance(self, step_number: int, confidence: str, request) -> dict[str, Any]:
+        """
+        Provide step-specific guidance matching original debug tool behavior.
+
+        This method generates debug-specific guidance that's used by get_step_guidance_message().
+        """
+        # Generate the next steps instruction based on required actions
+        required_actions = self.get_required_actions(step_number, confidence, request.findings, request.total_steps)
+
+        if step_number == 1:
+            next_steps = (
+                f"MANDATORY: DO NOT call the {self.get_name()} tool again immediately. You MUST first investigate "
+                f"the codebase using appropriate tools. CRITICAL AWARENESS: The reported symptoms might be "
+                f"caused by issues elsewhere in the code, not where symptoms appear. Also, after thorough "
+                f"investigation, it's possible NO BUG EXISTS - the issue might be a misunderstanding or "
+                f"user expectation mismatch. Search broadly, examine implementations, understand the logic flow. "
+                f"Only call {self.get_name()} again AFTER gathering concrete evidence. When you call "
+                f"{self.get_name()} next time, "
+                f"use step_number: {step_number + 1} and report specific files examined and findings discovered."
+            )
+        elif confidence in ["exploring", "low"]:
+            next_steps = (
+                f"STOP! Do NOT call {self.get_name()} again yet. Based on your findings, you've identified potential areas "
+                f"but need concrete evidence. MANDATORY ACTIONS before calling {self.get_name()} step {step_number + 1}:\n"
+                + "\n".join(f"{i+1}. {action}" for i, action in enumerate(required_actions))
+                + f"\n\nOnly call {self.get_name()} again with step_number: {step_number + 1} AFTER "
+                + "completing these investigations."
+            )
+        elif confidence in ["medium", "high", "very_high"]:
+            next_steps = (
+                f"WAIT! Your hypothesis needs verification. DO NOT call {self.get_name()} immediately. REQUIRED ACTIONS:\n"
+                + "\n".join(f"{i+1}. {action}" for i, action in enumerate(required_actions))
+                + f"\n\nREMEMBER: If you cannot find concrete evidence of a bug causing the reported symptoms, "
+                f"'no bug found' is a valid conclusion. Consider suggesting discussion with your thought partner "
+                f"or engineering assistant for clarification. Document findings with specific file:line references, "
+                f"then call {self.get_name()} with step_number: {step_number + 1}."
+            )
+        elif confidence == "almost_certain":
+            next_steps = (
+                "ALMOST CERTAIN - Prepare for final analysis. REQUIRED ACTIONS:\n"
+                + "\n".join(f"{i+1}. {action}" for i, action in enumerate(required_actions))
+                + "\n\nIMPORTANT: You're almost certain about the root cause. If you have NOT found the bug with "
+                "100% certainty, consider setting next_step_required=false to invoke expert analysis. The expert "
+                "can validate your hypotheses and provide additional insights. If you ARE 100% certain and have "
+                "identified the exact bug and fix, proceed to confidence='certain'. Otherwise, let expert analysis "
+                "help finalize the investigation."
+            )
+        else:
+            next_steps = (
+                f"PAUSE INVESTIGATION. Before calling {self.get_name()} step {step_number + 1}, you MUST examine code. "
+                + "Required: "
+                + ", ".join(required_actions[:2])
+                + ". "
+                + f"Your next {self.get_name()} call (step_number: {step_number + 1}) must include "
+                f"NEW evidence from actual code examination, not just theories. If no bug evidence "
+                f"is found, suggesting "
+                f"collaboration with thought partner is valuable. NO recursive {self.get_name()} calls "
+                f"without investigation work!"
+            )
+
+        return {"next_steps": next_steps}
+
+    # Hook method overrides for debug-specific behavior
+
+    def prepare_step_data(self, request) -> dict:
+        """
+        Prepare debug-specific step data for processing.
+        """
+        step_data = {
+            "step": request.step,
+            "step_number": request.step_number,
+            "findings": request.findings,
+            "files_checked": request.files_checked,
+            "relevant_files": request.relevant_files,
+            "relevant_context": request.relevant_context,
+            "issues_found": [],  # Debug tool doesn't use issues_found field
+            "confidence": request.confidence,
+            "hypothesis": request.hypothesis,
+            "images": request.images or [],
+        }
+        return step_data
+
+    def should_skip_expert_analysis(self, request, consolidated_findings) -> bool:
+        """
+        Debug tool skips expert analysis when agent has "certain" confidence.
+        """
+        return request.confidence == "certain" and not request.next_step_required
+
+    # Override inheritance hooks for debug-specific behavior
+
+    def get_completion_status(self) -> str:
+        """Debug tools use debug-specific status."""
+        return "certain_confidence_proceed_with_fix"
+
+    def get_completion_data_key(self) -> str:
+        """Debug uses 'complete_investigation' key."""
+        return "complete_investigation"
+
+    def get_final_analysis_from_request(self, request):
+        """Debug tools use 'hypothesis' field."""
+        return request.hypothesis
+
+    def get_confidence_level(self, request) -> str:
+        """Debug tools use 'certain' for high confidence."""
+        return "certain"
+
+    def get_completion_message(self) -> str:
+        """Debug-specific completion message."""
+        return (
+            "Investigation complete with CERTAIN confidence. You have identified the exact "
+            "root cause and a minimal fix. MANDATORY: Present the user with the root cause analysis "
+            "and IMMEDIATELY proceed with implementing the simple fix without requiring further "
+            "consultation. Focus on the precise, minimal change needed."
         )
 
-        # Combine everything
-        full_prompt = f"""{self.get_system_prompt()}{websearch_instruction}
+    def get_skip_reason(self) -> str:
+        """Debug-specific skip reason."""
+        return "Identified exact root cause with minimal fix requirement locally"
 
-{full_context}
+    def get_request_relevant_context(self, request) -> list:
+        """Get relevant_context for debug tool."""
+        try:
+            return request.relevant_context or []
+        except AttributeError:
+            return []
 
-Please debug this issue following the structured format in the system prompt.
-Focus on finding the root cause and providing actionable solutions."""
+    def get_skip_expert_analysis_status(self) -> str:
+        """Debug-specific expert analysis skip status."""
+        return "skipped_due_to_certain_confidence"
 
-        return full_prompt
+    def prepare_work_summary(self) -> str:
+        """Debug-specific work summary."""
+        return self._build_investigation_summary(self.consolidated_findings)
 
-    def _get_model_name(self, model_info: Optional[dict]) -> str:
-        """Extract friendly model name from model info."""
-        if model_info and model_info.get("model_response"):
-            return model_info["model_response"].friendly_name or "the model"
-        return "the model"
+    def get_completion_next_steps_message(self, expert_analysis_used: bool = False) -> str:
+        """
+        Debug-specific completion message.
 
-    def _generate_systematic_next_steps(self, model_name: str) -> str:
-        """Generate next steps for systematic investigation completion."""
-        return f"""**Expert Analysis Complete**
+        Args:
+            expert_analysis_used: True if expert analysis was successfully executed
+        """
+        base_message = (
+            "INVESTIGATION IS COMPLETE. YOU MUST now summarize and present ALL key findings, confirmed "
+            "hypotheses, and exact recommended fixes. Clearly identify the most likely root cause and "
+            "provide concrete, actionable implementation guidance. Highlight affected code paths and display "
+            "reasoning that led to this conclusion—make it easy for a developer to understand exactly where "
+            "the problem lies. Where necessary, show cause-and-effect / bug-trace call graph."
+        )
 
-{model_name} has analyzed your systematic investigation findings.
+        # Add expert analysis guidance only when expert analysis was actually used
+        if expert_analysis_used:
+            expert_guidance = self.get_expert_analysis_guidance()
+            if expert_guidance:
+                return f"{base_message}\n\n{expert_guidance}"
 
-**Next Steps:**
-1. **UPDATE INVESTIGATION DOCUMENT**: Add the expert analysis to your DEBUGGING_*.md file
-2. **REVIEW HYPOTHESES**: Examine the ranked hypotheses and evidence validation
-3. **IMPLEMENT FIXES**: Apply recommended minimal fixes in order of likelihood
-4. **VALIDATE CHANGES**: Test each fix thoroughly to ensure no regressions
-5. **DOCUMENT RESOLUTION**: Update investigation document with final resolution"""
+        return base_message
 
-    def _generate_standard_analysis_steps(self, model_name: str) -> str:
-        """Generate next steps for standard analysis completion."""
-        return f"""**Expert Analysis Complete**
+    def get_expert_analysis_guidance(self) -> str:
+        """
+        Get additional guidance for handling expert analysis results in debug context.
 
-{model_name} has analyzed your investigation findings.
+        Returns:
+            Additional guidance text for validating and using expert analysis findings
+        """
+        return (
+            "IMPORTANT: Expert debugging analysis has been provided above. You MUST validate "
+            "the expert's root cause analysis and proposed fixes against your own investigation. "
+            "Ensure the expert's findings align with the evidence you've gathered and that the "
+            "recommended solutions address the actual problem, not just symptoms. If the expert "
+            "suggests a different root cause than you identified, carefully consider both perspectives "
+            "and present a balanced assessment to the user."
+        )
 
-**Next Steps:**
-1. **REVIEW HYPOTHESES**: Examine the ranked hypotheses and evidence
-2. **IMPLEMENT FIXES**: Apply recommended minimal fixes in order of likelihood
-3. **VALIDATE CHANGES**: Test each fix thoroughly to ensure no regressions"""
+    def get_step_guidance_message(self, request) -> str:
+        """
+        Debug-specific step guidance with detailed investigation instructions.
+        """
+        step_guidance = self.get_step_guidance(request.step_number, request.confidence, request)
+        return step_guidance["next_steps"]
 
-    def _generate_general_analysis_steps(self, model_name: str) -> str:
-        """Generate next steps for general analysis responses."""
-        return f"""**Analysis from {model_name}**
+    def customize_workflow_response(self, response_data: dict, request) -> dict:
+        """
+        Customize response to match original debug tool format.
+        """
+        # Store initial issue on first step
+        if request.step_number == 1:
+            self.initial_issue = request.step
 
-**Next Steps:** Continue your systematic investigation based on the guidance provided, then return
-with comprehensive findings for expert analysis."""
+        # Convert generic status names to debug-specific ones
+        tool_name = self.get_name()
+        status_mapping = {
+            f"{tool_name}_in_progress": "investigation_in_progress",
+            f"pause_for_{tool_name}": "pause_for_investigation",
+            f"{tool_name}_required": "investigation_required",
+            f"{tool_name}_complete": "investigation_complete",
+        }
 
-    def format_response(self, response: str, request: DebugIssueRequest, model_info: Optional[dict] = None) -> str:
-        """Format the debugging response for Claude to present to user"""
-        # The base class automatically handles structured responses like 'files_required_to_continue'
-        # and 'analysis_complete' via SPECIAL_STATUS_MODELS, so we only handle normal text responses here
+        if response_data["status"] in status_mapping:
+            response_data["status"] = status_mapping[response_data["status"]]
 
-        model_name = self._get_model_name(model_info)
+        # Rename status field to match debug tool
+        if f"{tool_name}_status" in response_data:
+            response_data["investigation_status"] = response_data.pop(f"{tool_name}_status")
+            # Add debug-specific status fields
+            response_data["investigation_status"]["hypotheses_formed"] = len(self.consolidated_findings.hypotheses)
 
-        # For normal text responses, provide general guidance
-        next_steps = self._generate_general_analysis_steps(model_name)
+        # Rename complete investigation data
+        if f"complete_{tool_name}" in response_data:
+            response_data["complete_investigation"] = response_data.pop(f"complete_{tool_name}")
 
-        return f"""{response}
+        # Map the completion flag to match original debug tool
+        if f"{tool_name}_complete" in response_data:
+            response_data["investigation_complete"] = response_data.pop(f"{tool_name}_complete")
 
----
+        # Map the required flag to match original debug tool
+        if f"{tool_name}_required" in response_data:
+            response_data["investigation_required"] = response_data.pop(f"{tool_name}_required")
 
-{next_steps}"""
+        return response_data
+
+    # Required abstract methods from BaseTool
+    def get_request_model(self):
+        """Return the debug-specific request model."""
+        return DebugInvestigationRequest
+
+    async def prepare_prompt(self, request) -> str:
+        """Not used - workflow tools use execute_workflow()."""
+        return ""  # Workflow tools use execute_workflow() directly

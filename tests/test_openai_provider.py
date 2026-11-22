@@ -47,14 +47,13 @@ class TestOpenAIProvider:
         assert provider.validate_model_name("o3-mini") is True
         assert provider.validate_model_name("o3-pro") is True
         assert provider.validate_model_name("o4-mini") is True
-        assert provider.validate_model_name("o4-mini-high") is True
+        assert provider.validate_model_name("o4-mini") is True
 
         # Test valid aliases
         assert provider.validate_model_name("mini") is True
         assert provider.validate_model_name("o3mini") is True
         assert provider.validate_model_name("o4mini") is True
-        assert provider.validate_model_name("o4minihigh") is True
-        assert provider.validate_model_name("o4minihi") is True
+        assert provider.validate_model_name("o4mini") is True
 
         # Test invalid model
         assert provider.validate_model_name("invalid-model") is False
@@ -69,15 +68,14 @@ class TestOpenAIProvider:
         assert provider._resolve_model_name("mini") == "o4-mini"
         assert provider._resolve_model_name("o3mini") == "o3-mini"
         assert provider._resolve_model_name("o4mini") == "o4-mini"
-        assert provider._resolve_model_name("o4minihigh") == "o4-mini-high"
-        assert provider._resolve_model_name("o4minihi") == "o4-mini-high"
+        assert provider._resolve_model_name("o4mini") == "o4-mini"
 
         # Test full name passthrough
         assert provider._resolve_model_name("o3") == "o3"
         assert provider._resolve_model_name("o3-mini") == "o3-mini"
         assert provider._resolve_model_name("o3-pro") == "o3-pro-2025-06-10"
         assert provider._resolve_model_name("o4-mini") == "o4-mini"
-        assert provider._resolve_model_name("o4-mini-high") == "o4-mini-high"
+        assert provider._resolve_model_name("o4-mini") == "o4-mini"
 
     def test_get_capabilities_o3(self):
         """Test getting model capabilities for O3."""
@@ -85,7 +83,7 @@ class TestOpenAIProvider:
 
         capabilities = provider.get_capabilities("o3")
         assert capabilities.model_name == "o3"  # Should NOT be resolved in capabilities
-        assert capabilities.friendly_name == "OpenAI"
+        assert capabilities.friendly_name == "OpenAI (O3)"
         assert capabilities.context_window == 200_000
         assert capabilities.provider == ProviderType.OPENAI
         assert not capabilities.supports_extended_thinking
@@ -101,8 +99,8 @@ class TestOpenAIProvider:
         provider = OpenAIModelProvider("test-key")
 
         capabilities = provider.get_capabilities("mini")
-        assert capabilities.model_name == "mini"  # Capabilities should show original request
-        assert capabilities.friendly_name == "OpenAI"
+        assert capabilities.model_name == "o4-mini"  # Capabilities should show resolved model name
+        assert capabilities.friendly_name == "OpenAI (O4-mini)"
         assert capabilities.context_window == 200_000
         assert capabilities.provider == ProviderType.OPENAI
 
@@ -122,7 +120,7 @@ class TestOpenAIProvider:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "Test response"
         mock_response.choices[0].finish_reason = "stop"
-        mock_response.model = "o4-mini"  # API returns the resolved model name
+        mock_response.model = "gpt-4.1-2025-04-14"  # API returns the resolved model name
         mock_response.id = "test-id"
         mock_response.created = 1234567890
         mock_response.usage = MagicMock()
@@ -134,19 +132,23 @@ class TestOpenAIProvider:
 
         provider = OpenAIModelProvider("test-key")
 
-        # Call generate_content with alias 'mini'
+        # Call generate_content with alias 'gpt4.1' (resolves to gpt-4.1-2025-04-14, supports temperature)
         result = provider.generate_content(
-            prompt="Test prompt", model_name="mini", temperature=1.0  # This should be resolved to "o4-mini"
+            prompt="Test prompt",
+            model_name="gpt4.1",
+            temperature=1.0,  # This should be resolved to "gpt-4.1-2025-04-14"
         )
 
         # Verify the API was called with the RESOLVED model name
         mock_client.chat.completions.create.assert_called_once()
         call_kwargs = mock_client.chat.completions.create.call_args[1]
 
-        # CRITICAL ASSERTION: The API should receive "o4-mini", not "mini"
-        assert call_kwargs["model"] == "o4-mini", f"Expected 'o4-mini' but API received '{call_kwargs['model']}'"
+        # CRITICAL ASSERTION: The API should receive "gpt-4.1-2025-04-14", not "gpt4.1"
+        assert (
+            call_kwargs["model"] == "gpt-4.1-2025-04-14"
+        ), f"Expected 'gpt-4.1-2025-04-14' but API received '{call_kwargs['model']}'"
 
-        # Verify other parameters
+        # Verify other parameters (gpt-4.1 supports temperature unlike O3/O4 models)
         assert call_kwargs["temperature"] == 1.0
         assert len(call_kwargs["messages"]) == 1
         assert call_kwargs["messages"][0]["role"] == "user"
@@ -154,7 +156,7 @@ class TestOpenAIProvider:
 
         # Verify response
         assert result.content == "Test response"
-        assert result.model_name == "o4-mini"  # Should be the resolved name
+        assert result.model_name == "gpt-4.1-2025-04-14"  # Should be the resolved name
 
     @patch("providers.openai_compatible.OpenAI")
     def test_generate_content_other_aliases(self, mock_openai_class):
@@ -180,11 +182,11 @@ class TestOpenAIProvider:
         call_kwargs = mock_client.chat.completions.create.call_args[1]
         assert call_kwargs["model"] == "o3-mini"
 
-        # Test o4minihigh -> o4-mini-high
-        mock_response.model = "o4-mini-high"
-        provider.generate_content(prompt="Test", model_name="o4minihigh", temperature=1.0)
+        # Test o4mini -> o4-mini
+        mock_response.model = "o4-mini"
+        provider.generate_content(prompt="Test", model_name="o4mini", temperature=1.0)
         call_kwargs = mock_client.chat.completions.create.call_args[1]
-        assert call_kwargs["model"] == "o4-mini-high"
+        assert call_kwargs["model"] == "o4-mini"
 
     @patch("providers.openai_compatible.OpenAI")
     def test_generate_content_no_alias_passthrough(self, mock_openai_class):

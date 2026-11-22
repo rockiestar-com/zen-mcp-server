@@ -24,8 +24,6 @@ class ModelProviderRegistry:
             cls._instance._providers = {}
             cls._instance._initialized_providers = {}
             logging.debug(f"REGISTRY: Created instance {cls._instance}")
-        else:
-            logging.debug(f"REGISTRY: Returning existing instance {cls._instance}")
         return cls._instance
 
     @classmethod
@@ -84,6 +82,29 @@ class ModelProviderRegistry:
                 api_key = api_key or ""
                 # Initialize custom provider with both API key and base URL
                 provider = provider_class(api_key=api_key, base_url=custom_url)
+        elif provider_type == ProviderType.AZURE_OPENAI:
+            # Handle Azure OpenAI special initialization
+            resource_name = os.getenv("AZURE_OPENAI_RESOURCE_NAME", "")
+            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+
+            # Check if either resource name or endpoint is provided
+            if not resource_name and not endpoint:
+                if api_key:  # Key is set but neither resource name nor endpoint is provided
+                    logging.warning(
+                        "AZURE_OPENAI_API_KEY set but neither AZURE_OPENAI_RESOURCE_NAME nor AZURE_OPENAI_ENDPOINT provided – skipping Azure OpenAI provider"
+                    )
+                return None
+            if not api_key:
+                return None
+
+            # Get optional API version
+            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+
+            # Initialize Azure OpenAI provider with either resource name or endpoint
+            if endpoint:
+                provider = provider_class(endpoint=endpoint, api_key=api_key, api_version=api_version)
+            else:
+                provider = provider_class(resource_name=resource_name, api_key=api_key, api_version=api_version)
         else:
             if not api_key:
                 return None
@@ -105,7 +126,7 @@ class ModelProviderRegistry:
         3. OPENROUTER - Catch-all for cloud models via unified API
 
         Args:
-            model_name: Name of the model (e.g., "gemini-2.5-flash-preview-05-20", "o3-mini")
+            model_name: Name of the model (e.g., "gemini-2.5-flash", "o3-mini")
 
         Returns:
             ModelProvider instance that supports this model
@@ -114,10 +135,13 @@ class ModelProviderRegistry:
 
         # Define explicit provider priority order
         # Native APIs first, then custom endpoints, then catch-all providers
+        # Azure OpenAI takes precedence over regular OpenAI when configured
         PROVIDER_PRIORITY_ORDER = [
             ProviderType.GOOGLE,  # Direct Gemini access
+            ProviderType.AZURE_OPENAI,  # Azure OpenAI (checked before regular OpenAI)
             ProviderType.OPENAI,  # Direct OpenAI access
             ProviderType.XAI,  # Direct X.AI GROK access
+            ProviderType.DIAL,  # DIAL unified API access
             ProviderType.CUSTOM,  # Local/self-hosted models
             ProviderType.OPENROUTER,  # Catch-all for cloud models
         ]
@@ -127,8 +151,18 @@ class ModelProviderRegistry:
         logging.debug(f"Registry instance: {instance}")
         logging.debug(f"Available providers in registry: {list(instance._providers.keys())}")
 
+        # Special handling: If Azure OpenAI is configured, skip regular OpenAI
+        azure_configured = bool(
+            (os.getenv("AZURE_OPENAI_RESOURCE_NAME") or os.getenv("AZURE_OPENAI_ENDPOINT"))
+            and os.getenv("AZURE_OPENAI_API_KEY")
+        )
+
         for provider_type in PROVIDER_PRIORITY_ORDER:
-            logging.debug(f"Checking provider_type: {provider_type}")
+            # Skip regular OpenAI if Azure OpenAI is configured
+            if provider_type == ProviderType.OPENAI and azure_configured:
+                logging.debug(f"Skipping {provider_type} because Azure OpenAI is configured")
+                continue
+
             if provider_type in instance._providers:
                 logging.debug(f"Found {provider_type} in registry")
                 # Get or create provider instance
@@ -179,7 +213,21 @@ class ModelProviderRegistry:
                 continue
 
             for model_name in available:
-                if restriction_service and not restriction_service.is_allowed(provider_type, model_name):
+                # =====================================================================================
+                # CRITICAL: Prevent double restriction filtering (Fixed Issue #98)
+                # =====================================================================================
+                # Previously, both the provider AND registry applied restrictions, causing
+                # double-filtering that resulted in "no models available" errors.
+                #
+                # Logic: If respect_restrictions=True, provider already filtered models,
+                # so registry should NOT filter them again.
+                # TEST COVERAGE: tests/test_provider_routing_bugs.py::TestOpenRouterAliasRestrictions
+                # =====================================================================================
+                if (
+                    restriction_service
+                    and not respect_restrictions  # Only filter if provider didn't already filter
+                    and not restriction_service.is_allowed(provider_type, model_name)
+                ):
                     logging.debug("Model %s filtered by restrictions", model_name)
                     continue
                 models[model_name] = provider_type
@@ -220,9 +268,11 @@ class ModelProviderRegistry:
         key_mapping = {
             ProviderType.GOOGLE: "GEMINI_API_KEY",
             ProviderType.OPENAI: "OPENAI_API_KEY",
+            ProviderType.AZURE_OPENAI: "AZURE_OPENAI_API_KEY",
             ProviderType.XAI: "XAI_API_KEY",
             ProviderType.OPENROUTER: "OPENROUTER_API_KEY",
             ProviderType.CUSTOM: "CUSTOM_API_KEY",  # Can be empty for providers that don't need auth
+            ProviderType.DIAL: "DIAL_API_KEY",
         }
 
         env_var = key_mapping.get(provider_type)
@@ -254,24 +304,30 @@ class ModelProviderRegistry:
 
         # Group by provider
         openai_models = [m for m, p in available_models.items() if p == ProviderType.OPENAI]
+        azure_openai_models = [m for m, p in available_models.items() if p == ProviderType.AZURE_OPENAI]
         gemini_models = [m for m, p in available_models.items() if p == ProviderType.GOOGLE]
         xai_models = [m for m, p in available_models.items() if p == ProviderType.XAI]
         openrouter_models = [m for m, p in available_models.items() if p == ProviderType.OPENROUTER]
         custom_models = [m for m, p in available_models.items() if p == ProviderType.CUSTOM]
 
         openai_available = bool(openai_models)
+        azure_openai_available = bool(azure_openai_models)
         gemini_available = bool(gemini_models)
         xai_available = bool(xai_models)
         openrouter_available = bool(openrouter_models)
         custom_available = bool(custom_models)
 
+        # Prefer Azure OpenAI over regular OpenAI if available
+        openai_or_azure_available = azure_openai_available or openai_available
+        openai_or_azure_models = azure_openai_models if azure_openai_available else openai_models
+
         if tool_category == ToolModelCategory.EXTENDED_REASONING:
             # Prefer thinking-capable models for deep reasoning tools
-            if openai_available and "o3" in openai_models:
+            if openai_or_azure_available and "o3" in openai_or_azure_models:
                 return "o3"  # O3 for deep reasoning
-            elif openai_available and openai_models:
-                # Fall back to any available OpenAI model
-                return openai_models[0]
+            elif openai_or_azure_available and openai_or_azure_models:
+                # Fall back to any available OpenAI/Azure model
+                return openai_or_azure_models[0]
             elif xai_available and "grok-3" in xai_models:
                 return "grok-3"  # GROK-3 for deep reasoning
             elif xai_available and xai_models:
@@ -295,17 +351,17 @@ class ModelProviderRegistry:
                 return custom_models[0]
             else:
                 # Fallback to pro if nothing found
-                return "gemini-2.5-pro-preview-06-05"
+                return "gemini-2.5-pro"
 
         elif tool_category == ToolModelCategory.FAST_RESPONSE:
             # Prefer fast, cost-efficient models
-            if openai_available and "o4-mini" in openai_models:
+            if openai_or_azure_available and "o4-mini" in openai_or_azure_models:
                 return "o4-mini"  # Latest, fast and efficient
-            elif openai_available and "o3-mini" in openai_models:
+            elif openai_or_azure_available and "o3-mini" in openai_or_azure_models:
                 return "o3-mini"  # Second choice
-            elif openai_available and openai_models:
-                # Fall back to any available OpenAI model
-                return openai_models[0]
+            elif openai_or_azure_available and openai_or_azure_models:
+                # Fall back to any available OpenAI/Azure model
+                return openai_or_azure_models[0]
             elif xai_available and "grok-3-fast" in xai_models:
                 return "grok-3-fast"  # GROK-3 Fast for speed
             elif xai_available and xai_models:
@@ -313,7 +369,11 @@ class ModelProviderRegistry:
                 return xai_models[0]
             elif gemini_available and any("flash" in m for m in gemini_models):
                 # Find the flash model (handles full names)
-                return next(m for m in gemini_models if "flash" in m)
+                # Prefer 2.5 over 2.0 for backward compatibility
+                flash_models = [m for m in gemini_models if "flash" in m]
+                # Sort to ensure 2.5 comes before 2.0
+                flash_models_sorted = sorted(flash_models, reverse=True)
+                return flash_models_sorted[0]
             elif gemini_available and gemini_models:
                 # Fall back to any available Gemini model
                 return gemini_models[0]
@@ -325,21 +385,24 @@ class ModelProviderRegistry:
                 return custom_models[0]
             else:
                 # Default to flash
-                return "gemini-2.5-flash-preview-05-20"
+                return "gemini-2.5-flash"
 
         # BALANCED or no category specified - use existing balanced logic
-        if openai_available and "o4-mini" in openai_models:
+        if openai_or_azure_available and "o4-mini" in openai_or_azure_models:
             return "o4-mini"  # Latest balanced performance/cost
-        elif openai_available and "o3-mini" in openai_models:
+        elif openai_or_azure_available and "o3-mini" in openai_or_azure_models:
             return "o3-mini"  # Second choice
-        elif openai_available and openai_models:
-            return openai_models[0]
+        elif openai_or_azure_available and openai_or_azure_models:
+            return openai_or_azure_models[0]
         elif xai_available and "grok-3" in xai_models:
             return "grok-3"  # GROK-3 as balanced choice
         elif xai_available and xai_models:
             return xai_models[0]
         elif gemini_available and any("flash" in m for m in gemini_models):
-            return next(m for m in gemini_models if "flash" in m)
+            # Prefer 2.5 over 2.0 for backward compatibility
+            flash_models = [m for m in gemini_models if "flash" in m]
+            flash_models_sorted = sorted(flash_models, reverse=True)
+            return flash_models_sorted[0]
         elif gemini_available and gemini_models:
             return gemini_models[0]
         elif openrouter_available:
@@ -353,7 +416,7 @@ class ModelProviderRegistry:
                 # This might happen if all models are restricted
                 logging.warning("No models available due to restrictions")
             # Return a reasonable default for backward compatibility
-            return "gemini-2.5-flash-preview-05-20"
+            return "gemini-2.5-flash"
 
     @classmethod
     def _find_extended_thinking_model(cls) -> Optional[str]:
@@ -381,9 +444,9 @@ class ModelProviderRegistry:
         if openrouter_provider:
             # Prefer models known for deep reasoning
             preferred_models = [
-                "anthropic/claude-3.5-sonnet",
-                "anthropic/claude-3-opus-20240229",
-                "google/gemini-2.5-pro-preview-06-05",
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-opus-4",
+                "google/gemini-2.5-pro",
                 "google/gemini-pro-1.5",
                 "meta-llama/llama-3.1-70b-instruct",
                 "mistralai/mixtral-8x7b-instruct",

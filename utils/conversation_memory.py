@@ -159,7 +159,7 @@ class ConversationTurn(BaseModel):
         images: List of image paths referenced in this specific turn
         tool_name: Which tool generated this turn (for cross-tool tracking)
         model_provider: Provider used (e.g., "google", "openai")
-        model_name: Specific model used (e.g., "gemini-2.5-flash-preview-05-20", "o3-mini")
+        model_name: Specific model used (e.g., "gemini-2.5-flash", "o3-mini")
         model_metadata: Additional model-specific metadata (e.g., thinking mode, token usage)
     """
 
@@ -327,7 +327,7 @@ def add_turn(
         images: Optional list of images referenced in this turn
         tool_name: Name of the tool adding this turn (for attribution)
         model_provider: Provider used (e.g., "google", "openai")
-        model_name: Specific model used (e.g., "gemini-2.5-flash-preview-05-20", "o3-mini")
+        model_name: Specific model used (e.g., "gemini-2.5-flash", "o3-mini")
         model_metadata: Additional model info (e.g., thinking mode, token usage)
 
     Returns:
@@ -1033,9 +1033,14 @@ def _get_tool_formatted_content(turn: ConversationTurn) -> list[str]:
             from server import TOOLS
 
             tool = TOOLS.get(turn.tool_name)
-            if tool and hasattr(tool, "format_conversation_turn"):
-                # Use tool-specific formatting
-                return tool.format_conversation_turn(turn)
+            if tool:
+                # Use inheritance pattern - try to call the method directly
+                # If it doesn't exist or raises AttributeError, fall back to default
+                try:
+                    return tool.format_conversation_turn(turn)
+                except AttributeError:
+                    # Tool doesn't implement format_conversation_turn - use default
+                    pass
         except Exception as e:
             # Log but don't fail - fall back to default formatting
             logger.debug(f"[HISTORY] Could not get tool-specific formatting for {turn.tool_name}: {e}")

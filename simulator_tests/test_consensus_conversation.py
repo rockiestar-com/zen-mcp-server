@@ -8,11 +8,16 @@ and builds conversation context correctly when using continuation_id.
 
 import json
 
-from .base_test import BaseSimulatorTest
+from .conversation_base_test import ConversationBaseTest
 
 
-class TestConsensusConversation(BaseSimulatorTest):
+class TestConsensusConversation(ConversationBaseTest):
     """Test consensus tool conversation continuation functionality"""
+
+    def call_mcp_tool(self, tool_name: str, params: dict) -> tuple:
+        """Call an MCP tool in-process"""
+        response_text, continuation_id = self.call_mcp_tool_direct(tool_name, params)
+        return response_text, continuation_id
 
     @property
     def test_name(self) -> str:
@@ -39,6 +44,9 @@ class TestConsensusConversation(BaseSimulatorTest):
         try:
             self.logger.info("Testing consensus tool conversation continuation")
 
+            # Initialize for in-process tool calling
+            self.setUp()
+
             # Setup test files for context
             self.setup_test_files()
 
@@ -49,7 +57,7 @@ class TestConsensusConversation(BaseSimulatorTest):
                 {
                     "prompt": "Please use low thinking mode. I'm working on a web application and need advice on authentication. Can you look at this code?",
                     "files": [self.test_files["python"]],
-                    "model": "local-llama",
+                    "model": "flash",
                 },
             )
 
@@ -70,21 +78,25 @@ class TestConsensusConversation(BaseSimulatorTest):
             consensus_response, _ = self.call_mcp_tool(
                 "consensus",
                 {
-                    "prompt": "Based on our previous discussion about authentication, I need expert consensus: Should we implement OAuth2 or stick with simple session-based auth?",
+                    "step": "Based on our previous discussion about authentication, I need expert consensus: Should we implement OAuth2 or stick with simple session-based auth?",
+                    "step_number": 1,
+                    "total_steps": 2,
+                    "next_step_required": True,
+                    "findings": "Initial analysis needed on OAuth2 vs session-based authentication approaches for our web application",
                     "models": [
                         {
-                            "model": "local-llama",
+                            "model": "flash",
                             "stance": "for",
                             "stance_prompt": "Focus on OAuth2 benefits: security, scalability, and industry standards.",
                         },
                         {
-                            "model": "local-llama",
+                            "model": "flash",
                             "stance": "against",
                             "stance_prompt": "Focus on OAuth2 complexity: implementation challenges and simpler alternatives.",
                         },
                     ],
                     "continuation_id": continuation_id,
-                    "model": "local-llama",
+                    "model": "flash",
                 },
             )
 
@@ -107,8 +119,12 @@ class TestConsensusConversation(BaseSimulatorTest):
                 self.logger.error(f"Failed to parse consensus response as JSON. Full response: {consensus_response}")
                 return False
 
-            if consensus_data.get("status") != "consensus_success":
-                self.logger.error(f"Consensus failed with status: {consensus_data.get('status')}")
+            # Check for step 1 status (Claude analysis + first model consultation)
+            expected_status = "analysis_and_first_model_consulted"
+            if consensus_data.get("status") != expected_status:
+                self.logger.error(
+                    f"Consensus step 1 failed with status: {consensus_data.get('status')}, expected: {expected_status}"
+                )
                 if "error" in consensus_data:
                     self.logger.error(f"Error: {consensus_data['error']}")
                 return False
@@ -164,26 +180,29 @@ class TestConsensusConversation(BaseSimulatorTest):
             # Phase 4: Verify response structure
             self.logger.info("Phase 4: Verifying consensus response structure")
 
-            # Check that consensus has proper models_used
-            models_used = consensus_data.get("models_used", [])
-            if not models_used:
-                self.logger.error("Consensus response missing models_used")
+            # Check that we have model response from step 1
+            model_response = consensus_data.get("model_response")
+            if not model_response:
+                self.logger.error("Consensus step 1 response missing model_response")
                 return False
 
-            # Check that we have responses
-            responses = consensus_data.get("responses", [])
-            if not responses:
-                self.logger.error("Consensus response missing responses")
+            # Check that model response has expected structure
+            if not model_response.get("model") or not model_response.get("verdict"):
+                self.logger.error("Model response missing required fields (model or verdict)")
                 return False
 
-            # Verify at least one successful response
-            successful_responses = [r for r in responses if r.get("status") == "success"]
-            if not successful_responses:
-                self.logger.error("No successful responses in consensus")
+            # Check step information
+            if consensus_data.get("step_number") != 1:
+                self.logger.error(f"Expected step_number 1, got: {consensus_data.get('step_number')}")
                 return False
 
-            self.logger.info(f"Consensus used models: {models_used}")
-            self.logger.info(f"Consensus had {len(successful_responses)} successful responses")
+            if not consensus_data.get("next_step_required"):
+                self.logger.error("Expected next_step_required=True for step 1")
+                return False
+
+            self.logger.info(f"Consensus step 1 consulted model: {model_response.get('model')}")
+            self.logger.info(f"Model stance: {model_response.get('stance', 'neutral')}")
+            self.logger.info(f"Response status: {model_response.get('status', 'unknown')}")
 
             # Phase 5: Cross-tool continuation test
             self.logger.info("Phase 5: Testing cross-tool continuation from consensus")
@@ -194,7 +213,7 @@ class TestConsensusConversation(BaseSimulatorTest):
                 {
                     "prompt": "Based on our consensus discussion about authentication, can you summarize the key points?",
                     "continuation_id": continuation_id,
-                    "model": "local-llama",
+                    "model": "flash",
                 },
             )
 

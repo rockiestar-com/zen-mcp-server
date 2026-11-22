@@ -392,7 +392,7 @@ class TestThinkingModes:
 
     def test_thinking_budget_mapping(self):
         """Test that thinking modes map to correct budget values"""
-        from tools.base import BaseTool
+        from tools.shared.base_tool import BaseTool
 
         # Create a simple test tool
         class TestTool(BaseTool):
@@ -418,7 +418,7 @@ class TestThinkingModes:
         from providers.gemini import GeminiModelProvider
 
         provider = GeminiModelProvider(api_key="test-key")
-        flash_model = "gemini-2.5-flash-preview-05-20"
+        flash_model = "gemini-2.5-flash"
         flash_max_tokens = 24576
 
         expected_budgets = {

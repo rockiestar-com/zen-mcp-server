@@ -85,16 +85,16 @@ class TestBuggyBehaviorPrevention:
 
         # Verify both aliases and targets are included
         assert "flash" in all_known  # alias
-        assert "gemini-2.5-flash-preview-05-20" in all_known  # target
+        assert "gemini-2.5-flash" in all_known  # target
         assert "pro" in all_known  # alias
-        assert "gemini-2.5-pro-preview-06-05" in all_known  # target
+        assert "gemini-2.5-pro" in all_known  # target
 
         # Simulate admin restricting to target model names
         service = ModelRestrictionService()
         service.restrictions = {
             ProviderType.GOOGLE: {
-                "gemini-2.5-flash-preview-05-20",  # Target name restriction
-                "gemini-2.5-pro-preview-06-05",  # Target name restriction
+                "gemini-2.5-flash",  # Target name restriction
+                "gemini-2.5-pro",  # Target name restriction
             }
         }
 
@@ -105,8 +105,8 @@ class TestBuggyBehaviorPrevention:
             # Should NOT warn about these valid target models
             all_warnings = [str(call) for call in mock_logger.warning.call_args_list]
             for warning in all_warnings:
-                assert "gemini-2.5-flash-preview-05-20" not in warning or "not a recognized" not in warning
-                assert "gemini-2.5-pro-preview-06-05" not in warning or "not a recognized" not in warning
+                assert "gemini-2.5-flash" not in warning or "not a recognized" not in warning
+                assert "gemini-2.5-pro" not in warning or "not a recognized" not in warning
 
     def test_old_bug_policy_bypass_prevention(self):
         """
@@ -118,7 +118,7 @@ class TestBuggyBehaviorPrevention:
         provider = OpenAIModelProvider(api_key="test-key")
 
         # Simulate a scenario where admin wants to restrict specific targets
-        with patch.dict(os.environ, {"OPENAI_ALLOWED_MODELS": "o3-mini,o4-mini-high"}):
+        with patch.dict(os.environ, {"OPENAI_ALLOWED_MODELS": "o3-mini,o4-mini"}):
             # Clear cached restriction service
             import utils.model_restrictions
 
@@ -126,19 +126,21 @@ class TestBuggyBehaviorPrevention:
 
             # These should work because they're explicitly allowed
             assert provider.validate_model_name("o3-mini")
-            assert provider.validate_model_name("o4-mini-high")
+            assert provider.validate_model_name("o4-mini")
 
             # These should be blocked
-            assert not provider.validate_model_name("o4-mini")  # Not in allowed list
+            assert not provider.validate_model_name("o3-pro")  # Not in allowed list
             assert not provider.validate_model_name("o3")  # Not in allowed list
-            assert not provider.validate_model_name("mini")  # Resolves to o4-mini, not allowed
+
+            # This should be ALLOWED because it resolves to o4-mini which is in the allowed list
+            assert provider.validate_model_name("mini")  # Resolves to o4-mini, which IS allowed
 
             # Verify our list_all_known_models includes the restricted models
             all_known = provider.list_all_known_models()
             assert "o3-mini" in all_known  # Should be known (and allowed)
-            assert "o4-mini-high" in all_known  # Should be known (and allowed)
-            assert "o4-mini" in all_known  # Should be known (but blocked)
-            assert "mini" in all_known  # Should be known (but blocked)
+            assert "o4-mini" in all_known  # Should be known (and allowed)
+            assert "o3-pro" in all_known  # Should be known (but blocked)
+            assert "mini" in all_known  # Should be known (and allowed since it resolves to o4-mini)
 
     def test_demonstration_of_old_vs_new_interface(self):
         """
@@ -206,7 +208,7 @@ class TestBuggyBehaviorPrevention:
         """
         providers_to_test = [
             (OpenAIModelProvider(api_key="test-key"), "mini", "o4-mini"),
-            (GeminiModelProvider(api_key="test-key"), "flash", "gemini-2.5-flash-preview-05-20"),
+            (GeminiModelProvider(api_key="test-key"), "flash", "gemini-2.5-flash"),
         ]
 
         for provider, alias, target in providers_to_test:
